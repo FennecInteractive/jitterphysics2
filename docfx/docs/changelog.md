@@ -1,5 +1,12 @@
 # Changelog
 
+### Jitter 2.8.4 (2026-04-19)
+
+- Improved `CollisionManifold` generation by performing full clipping, producing better contact sets.
+- Fixed indexed `TriangleMesh` adjacency generation for meshes with duplicated seam vertices.
+- Added generic methods in `ShapeHelper`.
+- Improved XML documentation throughout the codebase.
+
 ### Jitter 2.8.3 (2026-04-13)
 
 - Added `SolveMode.Deterministic` - an optional cross-platform deterministic solver mode.
