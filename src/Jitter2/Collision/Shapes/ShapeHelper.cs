@@ -31,18 +31,20 @@ public static class ShapeHelper
         { 4, 8, 9 }, { 8, 5, 9 }, { 10, 6, 11 }, { 7, 10, 11 }
     };
 
-    /// <inheritdoc cref="Tessellate(ISupportMappable, int)"/>
+    /// <inheritdoc cref="Tessellate{TSupport}(in TSupport, int)"/>
     /// <param name="hullCollection">A collection to which the triangles are added.</param>
-    public static void Tessellate<T>(ISupportMappable support, T hullCollection, int subdivisions = 3)
-        where T : class, ICollection<JTriangle>
+    public static void Tessellate<TSupport, TCollection>(in TSupport support, TCollection hullCollection, int subdivisions = 3)
+        where TSupport : ISupportMappable
+        where TCollection : class, ICollection<JTriangle>
     {
         var sink = new CollectionSink<JTriangle>(hullCollection);
-        Tessellate(support, ref sink, subdivisions);
+        Tessellate(in support, ref sink, subdivisions);
     }
 
     /// <summary>
     /// Creates a tessellation of a shape defined by its support map and appends all generated triangles to the specified sink.
     /// </summary>
+    /// <typeparam name="TSupport">The support shape type.</typeparam>
     /// <typeparam name="TSink">The sink type receiving the generated triangles.</typeparam>
     /// <param name="support">The support map interface implemented by the shape.</param>
     /// <param name="hullSink">The sink receiving the generated triangles.</param>
@@ -51,7 +53,8 @@ public static class ShapeHelper
     /// The tessellated hull may not be perfectly convex. It is therefore not suited to be used with
     /// <see cref="ConvexHullShape"/>. The time complexity is O(4^n), where n is the number of subdivisions.
     /// </remarks>
-    public static void Tessellate<TSink>(ISupportMappable support, ref TSink hullSink, int subdivisions = 3)
+    public static void Tessellate<TSupport, TSink>(in TSupport support, ref TSink hullSink, int subdivisions = 3)
+        where TSupport : ISupportMappable
         where TSink : ISink<JTriangle>
     {
         for (int i = 0; i < 20; i++)
@@ -64,13 +67,13 @@ public static class ShapeHelper
             support.SupportMap(v2, out JVector sv2);
             support.SupportMap(v3, out JVector sv3);
 
-            Subdivide(support, ref hullSink, v1, v2, v3, sv1, sv2, sv3, subdivisions);
+            Subdivide(in support, ref hullSink, v1, v2, v3, sv1, sv2, sv3, subdivisions);
         }
     }
 
-    private static void Subdivide<TSink>(ISupportMappable support, ref TSink hullSink,
+    private static void Subdivide<TSupport, TSink>(in TSupport support, ref TSink hullSink,
         JVector v1, JVector v2, JVector v3, JVector p1, JVector p2, JVector p3,
-        int subdivisions) where TSink : ISink<JTriangle>
+        int subdivisions) where TSupport : ISupportMappable where TSink : ISink<JTriangle>
     {
         if (subdivisions <= 1)
         {
@@ -97,10 +100,10 @@ public static class ShapeHelper
 
         subdivisions -= 1;
 
-        Subdivide(support, ref hullSink, v1, h1, h3, p1, sp1, sp3, subdivisions);
-        Subdivide(support, ref hullSink, h1, v2, h2, sp1, p2, sp2, subdivisions);
-        Subdivide(support, ref hullSink, h3, h2, v3, sp3, sp2, p3, subdivisions);
-        Subdivide(support, ref hullSink, h2, h3, h1, sp2, sp3, sp1, subdivisions);
+        Subdivide(in support, ref hullSink, v1, h1, h3, p1, sp1, sp3, subdivisions);
+        Subdivide(in support, ref hullSink, h1, v2, h2, sp1, p2, sp2, subdivisions);
+        Subdivide(in support, ref hullSink, h3, h2, v3, sp3, sp2, p3, subdivisions);
+        Subdivide(in support, ref hullSink, h2, h3, h1, sp2, sp3, sp1, subdivisions);
     }
 
     /// <summary>
@@ -112,10 +115,11 @@ public static class ShapeHelper
     /// The tessellated hull may not be perfectly convex. It is therefore not suited to be used with
     /// <see cref="ConvexHullShape"/>. The time complexity is O(4^n), where n is the number of subdivisions.
     /// </remarks>
-    public static List<JTriangle> Tessellate(ISupportMappable support, int subdivisions = 3)
+    public static List<JTriangle> Tessellate<TSupport>(in TSupport support, int subdivisions = 3)
+        where TSupport : ISupportMappable
     {
         List<JTriangle> triangles = new();
-        Tessellate(support, triangles, subdivisions);
+        Tessellate(in support, triangles, subdivisions);
         return triangles;
     }
 
@@ -151,13 +155,15 @@ public static class ShapeHelper
         Tessellate(vertices, subdivisions);
 
     [Obsolete("Use Tessellate instead.")]
-    public static List<JTriangle> MakeHull(ISupportMappable support, int subdivisions = 3) =>
-        Tessellate(support, subdivisions);
+    public static List<JTriangle> MakeHull<TSupport>(in TSupport support, int subdivisions = 3)
+        where TSupport : ISupportMappable =>
+        Tessellate(in support, subdivisions);
 
     [Obsolete("Use Tessellate instead.")]
-    public static void MakeHull<T>(ISupportMappable support, T hullCollection, int subdivisions = 3)
-        where T : class, ICollection<JTriangle> =>
-        Tessellate(support, hullCollection, subdivisions);
+    public static void MakeHull<TSupport, TCollection>(in TSupport support, TCollection hullCollection, int subdivisions = 3)
+        where TSupport : ISupportMappable
+        where TCollection : class, ICollection<JTriangle> =>
+        Tessellate(in support, hullCollection, subdivisions);
 
     #endregion
 
@@ -168,8 +174,9 @@ public static class ShapeHelper
     /// <param name="orientation">The orientation of the shape.</param>
     /// <param name="position">The position of the shape.</param>
     /// <param name="box">The resulting bounding box.</param>
-    public static void CalculateBoundingBox(ISupportMappable support,
+    public static void CalculateBoundingBox<TSupport>(in TSupport support,
         in JQuaternion orientation, in JVector position, out JBoundingBox box)
+        where TSupport : ISupportMappable
     {
         JMatrix oriT = JMatrix.Transpose(JMatrix.CreateFromQuaternion(orientation));
 
@@ -246,7 +253,8 @@ public static class ShapeHelper
     /// triangles, projecting new vertices onto the unit sphere. Each final vertex direction is passed to the support
     /// mapper to generate a hull point. The time complexity is O(4^n), where n is the number of subdivisions.
     /// </remarks>
-    public static List<JVector> SampleHull(ISupportMappable support, int subdivisions = 3)
+    public static List<JVector> SampleHull<TSupport>(in TSupport support, int subdivisions = 3)
+        where TSupport : ISupportMappable
     {
         Stack<(JTriangle triangle, int depth)> stack = new();
 
@@ -306,8 +314,9 @@ public static class ShapeHelper
     /// <param name="centerOfMass">Output parameter for the calculated center of mass vector (relative to the Origin).</param>
     /// <param name="mass">Output parameter for the calculated mass (Volume * density 1.0).</param>
     /// <param name="subdivisions">The recursion depth for the surface tessellation (default 4).</param>
-    public static void CalculateMassInertia(ISupportMappable support, out JMatrix inertia, out JVector centerOfMass,
+    public static void CalculateMassInertia<TSupport>(in TSupport support, out JMatrix inertia, out JVector centerOfMass,
         out Real mass, int subdivisions = 4)
+        where TSupport : ISupportMappable
     {
         centerOfMass = JVector.Zero;
         inertia = JMatrix.Zero;
@@ -316,7 +325,7 @@ public static class ShapeHelper
         const Real a = (Real)(1.0 / 60.0), b = (Real)(1.0 / 120.0);
         JMatrix canonicalInertia = new(a, b, b, b, a, b, b, b, a);
 
-        foreach (JTriangle triangle in Tessellate(support, subdivisions))
+        foreach (JTriangle triangle in Tessellate(in support, subdivisions))
         {
             JMatrix transformation = JMatrix.FromColumns(triangle.V0, triangle.V1, triangle.V2);
             Real detA = transformation.Determinant();
