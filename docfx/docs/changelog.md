@@ -1,5 +1,9 @@
 # Changelog
 
+### Jitter 2.8.5 (2026-04-25)
+
+- Improved `CollisionManifold`.
+
 ### Jitter 2.8.4 (2026-04-19)
 
 - Improved `CollisionManifold` generation by performing full clipping, producing better contact sets.
