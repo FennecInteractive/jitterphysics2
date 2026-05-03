@@ -13,8 +13,8 @@
 
   <ItemGroup>
     <None Include="_package\README.md" Pack="true" PackagePath="" />
-    <None Include="_package\icon.png"  Pack="true" PackagePath="" />
-    <None Include="_package\LICENSE"   Pack="true" PackagePath="" />
+    <None Include="_package\icon.png" Pack="true" PackagePath="" />
+    <None Include="_package\LICENSE" Pack="true" PackagePath="" />
     <None Include="_package\THIRD-PARTY-NOTICES.txt" Pack="true" PackagePath="" />
   </ItemGroup>
 
@@ -53,6 +53,15 @@
     </Description>
     <AssemblyName>Jitter2.Double</AssemblyName> <!-- Custom assembly name -->
     <PackageTags>physics engine;collision;csharp;dotnet;double precision</PackageTags>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net8.0|AnyCPU'">
+    <DefineConstants>$(DefineConstants);USE_DOUBLE_PRECISION</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net9.0|AnyCPU'">
+    <DefineConstants>$(DefineConstants);USE_DOUBLE_PRECISION</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net10.0|AnyCPU'">
+    <DefineConstants>$(DefineConstants);USE_DOUBLE_PRECISION</DefineConstants>
   </PropertyGroup>
 
 </Project>
