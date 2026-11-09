@@ -17,7 +17,7 @@ namespace Jitter2.LinearMath;
 public struct JMatrix(
     Real m11, Real m12, Real m13,
     Real m21, Real m22, Real m23,
-    Real m31, Real m32, Real m33) : IEquatable<JMatrix>
+    Real m31, Real m32, Real m33) : IEquatable<JMatrix>, IFormattable
 {
     [FieldOffset(0 * sizeof(Real))] public Real M11 = m11;
     [FieldOffset(1 * sizeof(Real))] public Real M21 = m21;
@@ -60,15 +60,15 @@ public struct JMatrix(
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static JMatrix FromColumns(in JVector col1, in JVector col2, in JVector col3)
     {
-        Unsafe.SkipInit(out JMatrix res);
-        res.UnsafeGet(0) = col1;
-        res.UnsafeGet(1) = col2;
-        res.UnsafeGet(2) = col3;
-        return res;
+        Unsafe.SkipInit(out JMatrix result);
+        result.UnsafeGet(0) = col1;
+        result.UnsafeGet(1) = col2;
+        result.UnsafeGet(2) = col3;
+        return result;
     }
 
     /// <summary>
-    /// Gets a reference to a column vector by index using unsafe pointer arithmetic.
+    /// Gets a writable reference to a column vector without checking the index.
     /// </summary>
     /// <param name="index">The zero-based index of the column (0, 1, or 2).</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -134,7 +134,7 @@ public struct JMatrix(
     /// <summary>
     /// Creates a rotation matrix from an axis and an angle.
     /// </summary>
-    /// <param name="axis">The axis to rotate around.</param>
+    /// <param name="axis">The unit-length axis to rotate around.</param>
     /// <param name="angle">The angle of rotation in radians.</param>
     /// <returns>The rotation matrix.</returns>
     public static JMatrix CreateRotationMatrix(JVector axis, Real angle)
@@ -398,10 +398,54 @@ public struct JMatrix(
     /// Calculates the inverse of the matrix.
     /// </summary>
     /// <param name="matrix">The matrix to invert.</param>
-    /// <param name="result">Output: The inverted matrix, or a zero matrix if the determinant is zero.</param>
+    /// <param name="result">Output: The inverted matrix, or zero if a finite inverse cannot be computed.</param>
     /// <returns><c>true</c> if the matrix can be inverted; otherwise, <c>false</c>.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool Inverse(in JMatrix matrix, out JMatrix result)
+    {
+        if (TryInverseUnscaled(matrix, out JMatrix inverse))
+        {
+            result = inverse;
+            return true;
+        }
+
+        // Uniformly tiny or large matrices can overflow the determinant even when
+        // their inverse is representable. Keep the ordinary path for common scales.
+        Real scale = MathR.Max(MathR.Abs(matrix.M11), MathR.Max(MathR.Abs(matrix.M12), MathR.Abs(matrix.M13)));
+        scale = MathR.Max(scale, MathR.Max(MathR.Abs(matrix.M21), MathR.Max(MathR.Abs(matrix.M22), MathR.Abs(matrix.M23))));
+        scale = MathR.Max(scale, MathR.Max(MathR.Abs(matrix.M31), MathR.Max(MathR.Abs(matrix.M32), MathR.Abs(matrix.M33))));
+        if (scale > 0 && Real.IsFinite(scale))
+        {
+            JMatrix normalized = new(matrix.M11 / scale, matrix.M12 / scale, matrix.M13 / scale,
+                matrix.M21 / scale, matrix.M22 / scale, matrix.M23 / scale,
+                matrix.M31 / scale, matrix.M32 / scale, matrix.M33 / scale);
+            if (TryInverseUnscaled(normalized, out inverse))
+            {
+                inverse.M11 /= scale; inverse.M12 /= scale; inverse.M13 /= scale;
+                inverse.M21 /= scale; inverse.M22 /= scale; inverse.M23 /= scale;
+                inverse.M31 /= scale; inverse.M32 /= scale; inverse.M33 /= scale;
+                if (IsFinite(inverse))
+                {
+                    result = inverse;
+                    return true;
+                }
+            }
+        }
+
+        result = Zero;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsFinite(in JMatrix matrix)
+    {
+        return Real.IsFinite(matrix.M11) && Real.IsFinite(matrix.M12) && Real.IsFinite(matrix.M13) &&
+               Real.IsFinite(matrix.M21) && Real.IsFinite(matrix.M22) && Real.IsFinite(matrix.M23) &&
+               Real.IsFinite(matrix.M31) && Real.IsFinite(matrix.M32) && Real.IsFinite(matrix.M33);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryInverseUnscaled(in JMatrix matrix, out JMatrix result)
     {
         Real idet = (Real)1.0 / matrix.Determinant();
 
@@ -433,7 +477,7 @@ public struct JMatrix(
         result.M32 = num32 * idet;
         result.M33 = num33 * idet;
 
-        return true;
+        return IsFinite(result);
     }
 
     /// <summary>
@@ -458,22 +502,21 @@ public struct JMatrix(
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Multiply(in JMatrix matrix1, Real scaleFactor, out JMatrix result)
     {
-        Real num = scaleFactor;
-        result.M11 = matrix1.M11 * num;
-        result.M12 = matrix1.M12 * num;
-        result.M13 = matrix1.M13 * num;
-        result.M21 = matrix1.M21 * num;
-        result.M22 = matrix1.M22 * num;
-        result.M23 = matrix1.M23 * num;
-        result.M31 = matrix1.M31 * num;
-        result.M32 = matrix1.M32 * num;
-        result.M33 = matrix1.M33 * num;
+        result.M11 = matrix1.M11 * scaleFactor;
+        result.M12 = matrix1.M12 * scaleFactor;
+        result.M13 = matrix1.M13 * scaleFactor;
+        result.M21 = matrix1.M21 * scaleFactor;
+        result.M22 = matrix1.M22 * scaleFactor;
+        result.M23 = matrix1.M23 * scaleFactor;
+        result.M31 = matrix1.M31 * scaleFactor;
+        result.M32 = matrix1.M32 * scaleFactor;
+        result.M33 = matrix1.M33 * scaleFactor;
     }
 
     /// <summary>
     /// Creates a rotation matrix from a quaternion.
     /// </summary>
-    /// <param name="quaternion">The quaternion representing the rotation.</param>
+    /// <param name="quaternion">The unit quaternion representing the rotation.</param>
     /// <returns>The rotation matrix.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static JMatrix CreateFromQuaternion(JQuaternion quaternion)
@@ -504,7 +547,7 @@ public struct JMatrix(
     /// <summary>
     /// Creates a rotation matrix from a quaternion.
     /// </summary>
-    /// <param name="quaternion">The quaternion representing the rotation.</param>
+    /// <param name="quaternion">The unit quaternion representing the rotation.</param>
     /// <param name="result">Output: The rotation matrix.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void CreateFromQuaternion(in JQuaternion quaternion, out JMatrix result)
@@ -648,11 +691,20 @@ public struct JMatrix(
                M33.Equals(other.M33);
     }
 
-    public readonly override string ToString()
+    /// <summary>Returns a string representation of the matrix.</summary>
+    public readonly override string ToString() => ToString(null, null);
+
+    /// <summary>Formats the components using the specified numeric format and the current culture.</summary>
+    public readonly string ToString(string? format) => ToString(format, null);
+
+    /// <summary>Formats the components using the specified numeric format and culture.</summary>
+    /// <param name="format">A numeric format string, or null or empty to use the general format.</param>
+    /// <param name="formatProvider">The format provider, or null to use the current culture.</param>
+    public readonly string ToString(string? format, IFormatProvider? formatProvider)
     {
-        return $"M11={M11:F6}, M12={M12:F6}, M13={M13:F6}, " +
-               $"M21={M21:F6}, M22={M22:F6}, M23={M23:F6}, " +
-               $"M31={M31:F6}, M32={M32:F6}, M33={M33:F6}";
+        return $"M11={M11.ToString(format, formatProvider)}, M12={M12.ToString(format, formatProvider)}, M13={M13.ToString(format, formatProvider)}, " +
+               $"M21={M21.ToString(format, formatProvider)}, M22={M22.ToString(format, formatProvider)}, M23={M23.ToString(format, formatProvider)}, " +
+               $"M31={M31.ToString(format, formatProvider)}, M32={M32.ToString(format, formatProvider)}, M33={M33.ToString(format, formatProvider)}";
     }
 
     public readonly override bool Equals(object? obj)

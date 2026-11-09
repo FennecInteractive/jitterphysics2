@@ -18,12 +18,41 @@ public class AddRemoveTests
         world.Dispose();
     }
 
+    [TestCase]
+    public void RemovingBodiesWhileEnumeratingRigidBodies_ThrowsInsteadOfSkipping()
+    {
+        for (int i = 0; i < 10; i++) world.CreateRigidBody();
+
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            foreach (RigidBody body in world.RigidBodies)
+            {
+                if (body != world.NullBody) world.Remove(body);
+            }
+        });
+    }
+
     private class FilterOut(IDynamicTreeProxy shape) : IBroadPhaseFilter
     {
         public bool Filter(IDynamicTreeProxy shapeA, IDynamicTreeProxy shapeB)
         {
             return shapeA != shape && shapeB != shape;
         }
+    }
+
+    [TestCase]
+    public void DynamicTreeCalculateCost_ReturnsZeroForEmptyTree()
+    {
+        Assert.That(world.DynamicTree.CalculateCost(), Is.EqualTo(0.0d));
+
+        var body = world.CreateRigidBody();
+        body.AddShape(new SphereShape());
+
+        Assert.That(world.DynamicTree.CalculateCost(), Is.GreaterThan(0.0d));
+
+        world.Remove(body);
+
+        Assert.That(world.DynamicTree.CalculateCost(), Is.EqualTo(0.0d));
     }
 
     [TestCase]
@@ -110,6 +139,16 @@ public class AddRemoveTests
         Assert.Throws<ArgumentException>(() => world.Remove(body));
     }
 
+    [Test]
+    public void RemoveBodyTwice_ThrowsWithoutChangingWorld()
+    {
+        RigidBody body = world.CreateRigidBody();
+        world.Remove(body);
+
+        Assert.Throws<InvalidOperationException>(() => world.Remove(body));
+        Assert.DoesNotThrow(() => world.Step((Real)1.0 / 60, multiThread: false));
+    }
+
     [TestCase]
     public void RemoveConstraintFromWrongWorld()
     {
@@ -121,6 +160,18 @@ public class AddRemoveTests
         Assert.Throws<ArgumentException>(() => world.Remove(constraint));
     }
 
+    [Test]
+    public void RemoveConstraintTwice_ThrowsWithoutChangingWorld()
+    {
+        RigidBody body1 = world.CreateRigidBody();
+        RigidBody body2 = world.CreateRigidBody();
+        BallSocket constraint = world.CreateConstraint<BallSocket>(body1, body2);
+        world.Remove(constraint);
+
+        Assert.Throws<InvalidOperationException>(() => world.Remove(constraint));
+        Assert.DoesNotThrow(() => world.Step((Real)1.0 / 60, multiThread: false));
+    }
+
     [TestCase]
     public void CreateConstraintWithForeignBody()
     {
@@ -128,7 +179,10 @@ public class AddRemoveTests
         var local = world.CreateRigidBody();
         var foreign = other.CreateRigidBody();
 
-        Assert.Throws<ArgumentException>(() => world.CreateConstraint<BallSocket>(foreign, local));
-        Assert.Throws<ArgumentException>(() => world.CreateConstraint<BallSocket>(local, foreign));
+        var body1 = Assert.Throws<ArgumentException>(() => world.CreateConstraint<BallSocket>(foreign, local));
+        Assert.That(body1!.ParamName, Is.EqualTo("body1"));
+
+        var body2 = Assert.Throws<ArgumentException>(() => world.CreateConstraint<BallSocket>(local, foreign));
+        Assert.That(body2!.ParamName, Is.EqualTo("body2"));
     }
 }

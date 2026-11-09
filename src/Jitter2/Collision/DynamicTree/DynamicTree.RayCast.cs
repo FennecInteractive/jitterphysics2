@@ -56,19 +56,16 @@ public partial class DynamicTree
     }
 
     /// <summary>
-    /// Ray cast against the world.
+    /// Finds the nearest accepted ray hit in the tree.
     /// </summary>
     /// <param name="origin">Origin of the ray.</param>
     /// <param name="direction">Direction of the ray. Does not have to be normalized.</param>
-    /// <param name="pre">Optional pre-filter which allows to skip shapes in the detection.</param>
-    /// <param name="post">Optional post-filter which allows to skip detections.</param>
+    /// <param name="pre">Optional pre-filter that can skip candidate shapes.</param>
+    /// <param name="post">Optional post-filter that can skip candidate results.</param>
     /// <param name="proxy">The shape which was hit.</param>
-    /// <param name="normal">
-    /// The surface normal at the hit point. <see cref="JVector.Zero"/> if the ray does not hit,
-    /// or if the ray origin is inside the hit shape. Use the return value to determine whether
-    /// a hit occurred; do not rely on this being non-zero as a hit indicator.
-    /// </param>
-    /// <param name="lambda">Distance from the origin to the hit point in units of the ray direction. Zero if the origin is inside the hit shape.</param>
+    /// <param name="normal">The surface normal in world space. Zero if there is no hit or the origin is inside the shape.</param>
+    /// <param name="lambda">The hit parameter: <c>hitPoint = origin + lambda * direction</c>.
+    /// Zero if the origin is inside the hit shape.</param>
     /// <returns>True if the ray hits, false otherwise.</returns>
     public bool RayCast(JVector origin, JVector direction, RayCastFilterPre? pre, RayCastFilterPost? post,
         out IDynamicTreeProxy? proxy, out JVector normal, out Real lambda)
@@ -85,8 +82,18 @@ public partial class DynamicTree
         return hit;
     }
 
-    /// <inheritdoc cref="RayCast(JVector, JVector, RayCastFilterPre?, RayCastFilterPost?, out IDynamicTreeProxy?, out JVector, out Real)"/>
-    /// <param name="maxLambda">Maximum lambda of the ray's length to consider for intersections.</param>
+    /// <summary>
+    /// Finds the nearest accepted ray hit with a hit parameter less than <paramref name="maxLambda"/>.
+    /// </summary>
+    /// <returns>True if an accepted hit is found; otherwise, false.</returns>
+    /// <param name="origin">The ray origin in world space.</param>
+    /// <param name="direction">The ray direction; it need not be normalized.</param>
+    /// <param name="maxLambda">Exclusive upper bound for hit lambda; hits at this value are excluded.</param>
+    /// <param name="pre">Optional filter applied before the exact test.</param>
+    /// <param name="post">Optional filter applied after the exact test.</param>
+    /// <param name="proxy">The accepted proxy, or null if none is found.</param>
+    /// <param name="normal">The result normal in world space.</param>
+    /// <param name="lambda">The hit parameter: <c>hitPoint = origin + lambda * direction</c>.</param>
     public bool RayCast(JVector origin, JVector direction, Real maxLambda, RayCastFilterPre? pre, RayCastFilterPost? post,
         out IDynamicTreeProxy? proxy, out JVector normal, out Real lambda)
     {
@@ -107,74 +114,83 @@ public partial class DynamicTree
     {
         result = new RayCastResult();
 
-        if (root == -1)
+        if (root == NullNode)
         {
             return false;
         }
 
-        _stack ??= new Stack<int>(256);
-
-        _stack.Push(root);
-
-        bool globalHit = false;
-
-        result.Lambda = ray.Lambda;
-
-        while (_stack.Count > 0)
+        Stack<int> stack = QueryStack;
+        int baseCount = stack.Count;
+        try
         {
-            int pop = _stack.Pop();
+            stack.Push(root);
 
-            ref Node node = ref nodes[pop];
+            bool globalHit = false;
 
-            if (node.IsLeaf)
+            result.Lambda = ray.Lambda;
+
+            while (stack.Count > baseCount)
             {
-                if (node.Proxy is not IRayCastable irc) continue;
+                int index = stack.Pop();
 
-                if (ray.FilterPre != null && !ray.FilterPre(node.Proxy)) continue;
+                ref Node node = ref nodes[index];
 
-                Unsafe.SkipInit(out RayCastResult res);
-                bool hit = irc.RayCast(ray.Origin, ray.Direction, out res.Normal, out res.Lambda);
-                res.Entity = node.Proxy;
-
-                if (hit && res.Lambda < result.Lambda)
+                if (node.IsLeaf)
                 {
-                    if (ray.FilterPost != null && !ray.FilterPost(res)) continue;
-                    result = res;
-                    globalHit = true;
+                    IDynamicTreeProxy proxy = node.Proxy!;
+                    if (proxy is not IRayCastable rayCastable) continue;
+
+                    if (ray.FilterPre != null && !ray.FilterPre(proxy)) continue;
+
+                    Unsafe.SkipInit(out RayCastResult res);
+                    bool hit = rayCastable.RayCast(ray.Origin, ray.Direction, out res.Normal, out res.Lambda);
+                    res.Entity = proxy;
+
+                    // Keep the closest hit already accepted on ties; maxLambda is an exclusive bound.
+                    if (hit && res.Lambda < result.Lambda)
+                    {
+                        if (ray.FilterPost != null && !ray.FilterPost(res)) continue;
+                        result = res;
+                        globalHit = true;
+                    }
+
+                    continue;
                 }
 
-                continue;
-            }
+                ref Node lNode = ref nodes[node.Left];
+                ref Node rNode = ref nodes[node.Right];
 
-            ref Node lNode = ref nodes[node.Left];
-            ref Node rNode = ref nodes[node.Right];
+                bool lRes = lNode.ExpandedBox.RayIntersect(ray.Origin, ray.Direction, out Real lEnter);
+                bool rRes = rNode.ExpandedBox.RayIntersect(ray.Origin, ray.Direction, out Real rEnter);
 
-            bool lRes = lNode.ExpandedBox.RayIntersect(ray.Origin, ray.Direction, out Real lEnter);
-            bool rRes = rNode.ExpandedBox.RayIntersect(ray.Origin, ray.Direction, out Real rEnter);
+                if (lEnter > result.Lambda) lRes = false;
+                if (rEnter > result.Lambda) rRes = false;
 
-            if (lEnter > result.Lambda) lRes = false;
-            if (rEnter > result.Lambda) rRes = false;
-
-            if (lRes && rRes)
-            {
-                if (lEnter < rEnter)
+                if (lRes && rRes)
                 {
-                    _stack.Push(node.Right);
-                    _stack.Push(node.Left);
+                    if (lEnter < rEnter)
+                    {
+                        stack.Push(node.Right);
+                        stack.Push(node.Left);
+                    }
+                    else
+                    {
+                        stack.Push(node.Left);
+                        stack.Push(node.Right);
+                    }
                 }
                 else
                 {
-                    _stack.Push(node.Left);
-                    _stack.Push(node.Right);
+                    if (lRes) stack.Push(node.Left);
+                    if (rRes) stack.Push(node.Right);
                 }
             }
-            else
-            {
-                if (lRes) _stack.Push(node.Left);
-                if (rRes) _stack.Push(node.Right);
-            }
-        }
 
-        return globalHit;
+            return globalHit;
+        }
+        finally
+        {
+            PopTo(stack, baseCount);
+        }
     }
 }

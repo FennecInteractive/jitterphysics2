@@ -86,4 +86,60 @@ public class SequentialTests
         Assert.That(elements, Does.Contain(num1));
         Assert.That(elements, Does.Contain(num2));
     }
+
+    [TestCase]
+    public static void EnumerationWithoutChanges_VisitsEveryElementOnce()
+    {
+        PartitionedSet<Number> set = new();
+        var numbers = new[] { new Number(1), new Number(2), new Number(3), new Number(4) };
+        foreach (Number number in numbers) set.Add(number, number.Value % 2 == 0);
+
+        var visited = new List<Number>();
+        foreach (Number number in set) visited.Add(number);
+
+        Assert.That(visited, Is.EquivalentTo(numbers));
+    }
+}
+
+public class TrimTests
+{
+    [TestCase]
+    public static void PartitionedSet_TrimPreservesElementsAndInitialCapacityFloor()
+    {
+        var set = new PartitionedSet<SequentialTests.Number>(4);
+        var entries = Enumerable.Range(0, 10).Select(i => new SequentialTests.Number(i)).ToArray();
+
+        foreach (var entry in entries)
+        {
+            set.Add(entry, entry.Value % 2 == 0);
+        }
+
+        Assert.That(set.Capacity, Is.EqualTo(16));
+
+        for (int i = entries.Length - 1; i >= 5; i--)
+        {
+            set.Remove(entries[i]);
+        }
+
+        Assert.That(set.Trim(), Is.True);
+        Assert.That(set.Capacity, Is.EqualTo(8));
+        Assert.That(set.Count, Is.EqualTo(5));
+        Assert.That(set.ActiveCount, Is.EqualTo(3));
+        Assert.That(set.Elements.ToArray(), Is.EquivalentTo(entries[..5]));
+
+        foreach (var entry in entries[..5])
+        {
+            Assert.That(set.Contains(entry), Is.True);
+        }
+
+        for (int i = 4; i >= 0; i--)
+        {
+            set.Remove(entries[i]);
+        }
+
+        Assert.That(set.Trim(), Is.True);
+        Assert.That(set.Capacity, Is.EqualTo(4));
+        Assert.That(set.Trim(), Is.False);
+        Assert.That(set.Capacity, Is.EqualTo(4));
+    }
 }

@@ -17,19 +17,15 @@ using Lock = System.Object;
 namespace Jitter2.DataStructures;
 
 /// <summary>
-/// A thread-safe dictionary that partitions entries across multiple shards to reduce lock contention.
-/// Each shard has its own lock, allowing concurrent access to different shards.
+/// A dictionary divided into groups, each with a separate lock for concurrent access.
 /// </summary>
 /// <typeparam name="TKey">The type of keys in the dictionary.</typeparam>
 /// <typeparam name="TValue">The type of values in the dictionary.</typeparam>
 /// <remarks>
-/// <para>
-/// This implementation avoids the GC overhead of <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}"/>.
-/// </para>
-/// <para>
-/// <b>Threading:</b> Individual operations are not thread-safe. Callers must acquire the shard lock
-/// via <see cref="GetLock"/> before calling <see cref="Add"/>, <see cref="Remove"/>, or the indexer.
-/// </para>
+/// Individual operations do not acquire locks. Callers must acquire the lock
+/// via <see cref="GetLock"/> before calling <see cref="Add"/>, <see cref="Remove"/>,
+/// <see cref="TryGetValue"/>, or the indexer during concurrent writes. <see cref="TrimExcess"/>
+/// must run without any concurrent access to the dictionary.
 /// </remarks>
 internal class ShardedDictionary<TKey, TValue> where TKey : notnull
 {
@@ -90,6 +86,17 @@ internal class ShardedDictionary<TKey, TValue> where TKey : notnull
         {
             locks[i] = new Lock();
             dictionaries[i] = new Dictionary<TKey, TValue>();
+        }
+    }
+
+    /// <summary>
+    /// Sets the capacity of each shard to the actual number of entries it contains.
+    /// </summary>
+    public void TrimExcess()
+    {
+        for (int i = 0; i < dictionaries.Length; i++)
+        {
+            dictionaries[i].TrimExcess();
         }
     }
 

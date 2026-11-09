@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Jitter2.LinearMath;
@@ -12,11 +13,13 @@ using Jitter2.Unmanaged;
 namespace Jitter2.Dynamics.Constraints;
 
 /// <summary>
-/// Constrains the relative twist of two bodies. This constraint removes one angular
-/// degree of freedom when the limit is enforced.
+/// Limits relative twist around axes attached to two bodies, leaving swing and translation free.
 /// </summary>
 public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
 {
+    /// <inheritdoc />
+    public override string ToString() => FormatDescription(nameof(TwistAngle));
+
     [StructLayout(LayoutKind.Sequential)]
     public struct TwistLimitData
     {
@@ -31,8 +34,9 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
 
         public JQuaternion Q0;
 
-        public Real Angle1, Angle2;
+        public Real Angle1, Angle2, FixedAngle;
         public ushort Clamp;
+        public short Hemisphere;
 
         public Real BiasFactor;
         public Real Softness;
@@ -63,12 +67,22 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
     /// <param name="axis2">The twist axis for body 2 in world space.</param>
     /// <param name="limit">The allowed relative twist angle range.</param>
     /// <remarks>
-    /// Stores each axis in the local frame of its body and records the initial relative orientation.
+    /// The axes rotate with their respective bodies. The initial pose defines zero twist.
+    /// Equal or reversed limits fix the twist at their midpoint.
     /// Default values: <see cref="Softness"/> = <see cref="Constraint.DefaultAngularSoftness"/>, <see cref="Bias"/> = <see cref="Constraint.DefaultAngularBias"/>.
     /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="axis1"/> or <paramref name="axis2"/> is zero or contains a non-finite value,
+    /// or when either value in <paramref name="limit"/> is not finite.
+    /// </exception>
     public void Initialize(JVector axis1, JVector axis2, AngularLimit limit)
     {
         VerifyNotZero();
+        ArgumentCheck.NonZero(axis1, nameof(axis1));
+        ArgumentCheck.NonZero(axis2, nameof(axis2));
+        ArgumentCheck.Finite(limit.From, nameof(limit.From));
+        ArgumentCheck.Finite(limit.To, nameof(limit.To));
+
         ref TwistLimitData data = ref Data;
         ref RigidBodyData body1 = ref data.Body1.Data;
         ref RigidBodyData body2 = ref data.Body2.Data;
@@ -79,8 +93,9 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
         JVector.NormalizeInPlace(ref axis1);
         JVector.NormalizeInPlace(ref axis2);
 
-        data.Angle1 = StableMath.Sin((Real)limit.From / (Real)2.0);
-        data.Angle2 = StableMath.Sin((Real)limit.To / (Real)2.0);
+        data.Angle1 = (Real)limit.From;
+        data.Angle2 = (Real)limit.To;
+        data.FixedAngle = (Real)0.5 * (Real)limit.From + (Real)0.5 * (Real)limit.To;
 
         // Calculate local axes
         JVector u1 = JVector.ConjugatedTransform(axis1, body1.Orientation);
@@ -106,13 +121,20 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
     /// <summary>
     /// Sets the angular limits for the twist rotation.
     /// </summary>
+    /// <exception cref="ArgumentException">
+    /// Thrown when either assigned limit value is not finite.
+    /// </exception>
     public AngularLimit Limit
     {
         set
         {
+            ArgumentCheck.Finite(value.From, nameof(value.From));
+            ArgumentCheck.Finite(value.To, nameof(value.To));
+
             ref TwistLimitData data = ref Data;
-            data.Angle1 = StableMath.Sin((Real)value.From / (Real)2.0);
-            data.Angle2 = StableMath.Sin((Real)value.To / (Real)2.0);
+            data.Angle1 = (Real)value.From;
+            data.Angle2 = (Real)value.To;
+            data.FixedAngle = (Real)0.5 * (Real)value.From + (Real)0.5 * (Real)value.To;
         }
     }
 
@@ -121,12 +143,15 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
     /// </summary>
     /// <param name="axis1">The twist axis for body 1 in world space.</param>
     /// <param name="axis2">The twist axis for body 2 in world space.</param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="axis1"/> or <paramref name="axis2"/> is zero or contains a non-finite value.
+    /// </exception>
     public void Initialize(JVector axis1, JVector axis2)
     {
         Initialize(axis1, axis2, AngularLimit.Fixed);
     }
 
-    public static void PrepareForIterationTwistAngle(ref ConstraintData constraint, Real idt)
+    public static void PrepareForIterationTwistAngle(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, TwistLimitData>(ref constraint);
 
@@ -136,37 +161,29 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
         JQuaternion q1 = body1.Orientation;
         JQuaternion q2 = body2.Orientation;
 
-        JMatrix m = (-(Real)(1.0 / 2.0)) * QMatrix.ProjectMultiplyLeftRight(data.Q0 * q1.Conjugate(), q2);
-
-        JQuaternion q = data.Q0 * q1.Conjugate() * q2;
-
-        data.Jacobian = JVector.TransposedTransform(data.B, m);
-
-        data.EffectiveMass = JVector.Transform(data.Jacobian, body1.InverseInertiaWorld + body2.InverseInertiaWorld) * data.Jacobian;
-
-        data.EffectiveMass += (data.Softness * idt);
-
-        data.EffectiveMass = (Real)1.0 / data.EffectiveMass;
-
-        Real error = JVector.Dot(data.B, new JVector(q.X, q.Y, q.Z));
-
-        if (q.W < (Real)0.0)
-        {
-            error *= -(Real)1.0;
-            data.Jacobian *= -1;
-        }
+        Real error = AngularConstraintMath.CalculateTwist(data.Q0 * q1.Conjugate(), q2, data.B,
+            out data.Jacobian, out short hemisphere);
+        Real lower = data.Angle1, upper = data.Angle2, target = data.FixedAngle;
+        if (data.Hemisphere != 0 && data.Hemisphere != hemisphere) data.AccumulatedImpulse = 0;
+        data.Hemisphere = hemisphere;
 
         data.Clamp = 0;
+        bool fullRange = lower <= -MathR.PI && upper >= MathR.PI;
 
-        if (error >= data.Angle2)
+        if (lower >= upper)
+        {
+            data.Clamp = 3;
+            error = AngularConstraintMath.ShortestAngle(error - target, MathR.PI);
+        }
+        else if (!fullRange && error >= upper)
         {
             data.Clamp = 1;
-            error -= data.Angle2;
+            error -= upper;
         }
-        else if (error < data.Angle1)
+        else if (!fullRange && error <= lower)
         {
             data.Clamp = 2;
-            error -= data.Angle1;
+            error -= lower;
         }
         else
         {
@@ -174,10 +191,24 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
             return;
         }
 
-        data.Bias = error * data.BiasFactor * idt;
+        if (data.Clamp == 1) data.AccumulatedImpulse = MathR.Min(data.AccumulatedImpulse, 0);
+        else if (data.Clamp == 2) data.AccumulatedImpulse = MathR.Max(data.AccumulatedImpulse, 0);
 
-        body1.AngularVelocity += JVector.Transform(data.AccumulatedImpulse * data.Jacobian, body1.InverseInertiaWorld);
-        body2.AngularVelocity -= JVector.Transform(data.AccumulatedImpulse * data.Jacobian, body2.InverseInertiaWorld);
+        data.EffectiveMass = JVector.Transform(data.Jacobian, body1.InverseInertiaWorld + body2.InverseInertiaWorld) * data.Jacobian;
+        data.EffectiveMass += data.Softness * timeStep.InverseSubstepDt;
+        data.EffectiveMass = data.EffectiveMass > 0 ? (Real)1.0 / data.EffectiveMass : 0;
+        if (data.EffectiveMass == 0) data.AccumulatedImpulse = 0;
+
+        data.Bias = error * data.BiasFactor * timeStep.InverseStepDt;
+
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.AngularVelocity += JVector.Transform(data.AccumulatedImpulse * data.Jacobian, body1.InverseInertiaWorld);
+        }
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.AngularVelocity -= JVector.Transform(data.AccumulatedImpulse * data.Jacobian, body2.InverseInertiaWorld);
+        }
     }
 
     /// <summary>
@@ -198,8 +229,10 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
                 quat0 *= -(Real)1.0;
             }
 
-            Real error = JVector.Dot(data.B, new JVector(quat0.X, quat0.Y, quat0.Z));
-            return (JAngle)((Real)2.0 * StableMath.Asin(error));
+            Real projection = JVector.Dot(data.B, quat0.Vector);
+            JVector perpendicular = quat0.Vector - data.B * projection;
+            return (JAngle)((Real)2.0 * StableMath.Atan2(projection,
+                MathR.Sqrt(quat0.W * quat0.W + perpendicular.LengthSquared())));
         }
     }
 
@@ -207,45 +240,58 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
     /// Gets or sets the softness (compliance) of the constraint.
     /// </summary>
     /// <value>
-    /// Default is 0.0001. Higher values allow more angular error but improve stability.
+    /// Default is <see cref="Constraint.DefaultAngularSoftness"/>. Higher values allow more angular error but improve stability.
     /// </value>
     public Real Softness
     {
         get => Data.Softness;
-        set => Data.Softness = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.Softness = value;
+        }
     }
 
     /// <summary>
     /// Gets or sets the bias factor controlling how aggressively angular error is corrected.
     /// </summary>
     /// <value>
-    /// Default is 0.2. Range [0, 1]. Higher values correct errors faster but may cause instability.
+    /// Default is 0.2. Higher values correct errors faster but may cause instability.
     /// </value>
     public Real Bias
     {
         get => Data.BiasFactor;
-        set => Data.BiasFactor = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.BiasFactor = value;
+        }
     }
 
     /// <summary>
-    /// Gets the accumulated impulse applied by this constraint during the last step.
+    /// Gets the accumulated solver impulse from the last solved substep.
     /// </summary>
     public Real Impulse => Data.AccumulatedImpulse;
 
-    public override void DebugDraw(IDebugDrawer drawer)
+    public override void DebugDraw(IDebugDrawer drawer) => DebugDraw(drawer, DebugDrawSettings.Default);
+
+    /// <inheritdoc />
+    public override void DebugDraw(IDebugDrawer drawer, in DebugDrawSettings settings)
     {
+        ArgumentNullException.ThrowIfNull(drawer);
+        VerifyNotZero();
         ref TwistLimitData data = ref Data;
-        ref RigidBodyData body1 = ref data.Body1.Data;
-        ref RigidBodyData body2 = ref data.Body2.Data;
-
-        JVector.Transform(data.B, body2.Orientation, out JVector axis);
-
-        const Real axisLength = (Real)0.5;
-        drawer.DrawSegment(body1.Position, body1.Position + axis * axisLength);
-        drawer.DrawSegment(body2.Position, body2.Position + axis * axisLength);
+        JQuaternion referenceOrientation = Body1.Orientation * data.Q0.Conjugate();
+        JVector axis = JVector.Transform(data.B, referenceOrientation);
+        JVector reference = JVector.Transform(MathHelper.CreateOrthonormal(data.B), referenceOrientation);
+        JVector origin = GetDebugDrawOrigin(settings);
+        DebugDrawGeometry.AngularRange(drawer, origin, axis, reference, data.Angle1,
+            data.Angle2, Angle.Radian, settings);
+        drawer.DrawArrow(origin, JVector.Transform(data.B, Body2.Orientation) * (settings.GuideSize * (Real)0.6),
+            settings.CurrentColor, settings);
     }
 
-    public static void IterateTwistAngle(ref ConstraintData constraint, Real idt)
+    public static void IterateTwistAngle(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, TwistLimitData>(ref constraint);
         ref RigidBodyData body1 = ref constraint.Body1.Data;
@@ -255,7 +301,7 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
 
         Real jv = (body1.AngularVelocity - body2.AngularVelocity) * data.Jacobian;
 
-        Real softnessScalar = data.AccumulatedImpulse * (data.Softness * idt);
+        Real softnessScalar = data.AccumulatedImpulse * (data.Softness * timeStep.InverseSubstepDt);
 
         Real lambda = -data.EffectiveMass * (jv + data.Bias + softnessScalar);
 
@@ -266,14 +312,20 @@ public unsafe class TwistAngle : Constraint<TwistAngle.TwistLimitData>
         {
             data.AccumulatedImpulse = MathR.Min(data.AccumulatedImpulse, (Real)0.0);
         }
-        else
+        else if (data.Clamp == 2)
         {
             data.AccumulatedImpulse = MathR.Max(data.AccumulatedImpulse, (Real)0.0);
         }
 
         lambda = data.AccumulatedImpulse - origAcc;
 
-        body1.AngularVelocity += JVector.Transform(lambda * data.Jacobian, body1.InverseInertiaWorld);
-        body2.AngularVelocity -= JVector.Transform(lambda * data.Jacobian, body2.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.AngularVelocity += JVector.Transform(lambda * data.Jacobian, body1.InverseInertiaWorld);
+        }
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.AngularVelocity -= JVector.Transform(lambda * data.Jacobian, body2.InverseInertiaWorld);
+        }
     }
 }

@@ -38,9 +38,9 @@ public class SoftBody
 
     /// <summary>
     /// Gets a value indicating whether the soft body is active. A soft body is considered active
-    /// if its first vertex is active.
+    /// if its first vertex is still valid and active.
     /// </summary>
-    public bool IsActive => Vertices.Count > 0 && Vertices[0].IsActive;
+    public bool IsActive => Vertices.Count > 0 && Vertices[0].IsValid && Vertices[0].IsActive;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SoftBody"/> class.
@@ -53,13 +53,13 @@ public class SoftBody
     }
 
     /// <summary>
-    /// Adds a shape to the soft body and registers it with the world's dynamic tree.
+    /// Adds a shape to the soft body and includes it in collision detection.
     /// </summary>
     /// <param name="shape">The shape to add.</param>
     public void AddShape(SoftBodyShape shape)
     {
-        Shapes.Add(shape);
         World.DynamicTree.AddProxy(shape);
+        Shapes.Add(shape);
     }
 
     /// <summary>
@@ -73,28 +73,34 @@ public class SoftBody
 
     /// <summary>
     /// Destroys the soft body, removing all its components from the simulation world.
+    /// Safe to call more than once, including after the world has been cleared or disposed.
     /// </summary>
     public virtual void Destroy()
     {
         World.PostStep -= WorldOnPostStep;
 
-        foreach (var shape in Shapes)
+        if (!World.IsDisposed)
         {
-            World.DynamicTree.RemoveProxy(shape);
+            foreach (var shape in Shapes)
+            {
+                if (World.DynamicTree.Proxies.Contains(shape)) World.DynamicTree.RemoveProxy(shape);
+            }
+
+            foreach (var spring in Springs)
+            {
+                if (spring.IsValid) World.Remove(spring);
+            }
+
+            foreach (var point in Vertices)
+            {
+                if (point.IsValid) World.Remove(point);
+            }
         }
+
         Shapes.Clear();
-
-        foreach (var spring in Springs)
-        {
-            World.Remove(spring);
-        }
         Springs.Clear();
-
-        foreach (var point in Vertices)
-        {
-            World.Remove(point);
-        }
         Vertices.Clear();
+        active = false;
     }
 
     private bool active = true;
@@ -102,9 +108,16 @@ public class SoftBody
     /// <summary>
     /// Called after each world step to update the activation state of the soft body's shapes.
     /// </summary>
-    /// <param name="dt">The time step.</param>
-    protected virtual void WorldOnPostStep(Real dt)
+    /// <param name="timeStep">The full step and substep timing information.</param>
+    protected virtual void WorldOnPostStep(TimeStep timeStep)
     {
+        // World.Clear removes the vertices without going through SoftBody.Destroy.
+        if (Vertices.Count > 0 && !Vertices[0].IsValid)
+        {
+            Destroy();
+            return;
+        }
+
         if (IsActive == active) return;
         active = IsActive;
 

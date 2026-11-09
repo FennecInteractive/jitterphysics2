@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Jitter2.LinearMath;
@@ -12,11 +13,13 @@ using Jitter2.Unmanaged;
 namespace Jitter2.Dynamics.Constraints;
 
 /// <summary>
-/// Implements a ball-and-socket joint that anchors a point on each body together,
-/// removing three translational degrees of freedom.
+/// Keeps an anchor point on each body together while allowing all relative rotation.
 /// </summary>
 public unsafe class BallSocket : Constraint<BallSocket.BallSocketData>
 {
+    /// <inheritdoc />
+    public override string ToString() => FormatDescription(nameof(BallSocket));
+
     [StructLayout(LayoutKind.Sequential)]
     public struct BallSocketData
     {
@@ -59,12 +62,16 @@ public unsafe class BallSocket : Constraint<BallSocket.BallSocketData>
     /// </summary>
     /// <param name="anchor">The anchor point in world space, shared by both bodies.</param>
     /// <remarks>
-    /// Computes local anchor points for each body from their current poses.
     /// Default values: <see cref="Bias"/> = <see cref="Constraint.DefaultLinearBias"/>, <see cref="Softness"/> = <see cref="Constraint.DefaultLinearSoftness"/>.
     /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="anchor"/> contains a non-finite value.
+    /// </exception>
     public void Initialize(JVector anchor)
     {
         VerifyNotZero();
+        ArgumentCheck.Finite(anchor, nameof(anchor));
+
         ref BallSocketData data = ref Data;
         ref RigidBodyData body1 = ref data.Body1.Data;
         ref RigidBodyData body2 = ref data.Body2.Data;
@@ -88,6 +95,8 @@ public unsafe class BallSocket : Constraint<BallSocket.BallSocketData>
     {
         set
         {
+            DebugCheck.IsFinite(value, nameof(value));
+
             ref BallSocketData data = ref Data;
             ref RigidBodyData body1 = ref data.Body1.Data;
             JVector.Subtract(value, body1.Position, out data.LocalAnchor1);
@@ -112,6 +121,8 @@ public unsafe class BallSocket : Constraint<BallSocket.BallSocketData>
     {
         set
         {
+            DebugCheck.IsFinite(value, nameof(value));
+
             ref BallSocketData data = ref Data;
             ref RigidBodyData body2 = ref data.Body2.Data;
             JVector.Subtract(value, body2.Position, out data.LocalAnchor2);
@@ -127,7 +138,7 @@ public unsafe class BallSocket : Constraint<BallSocket.BallSocketData>
         }
     }
 
-    public static void PrepareForIterationBallSocket(ref ConstraintData constraint, Real idt)
+    public static void PrepareForIterationBallSocket(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, BallSocketData>(ref constraint);
         ref RigidBodyData body1 = ref data.Body1.Data;
@@ -142,61 +153,75 @@ public unsafe class BallSocket : Constraint<BallSocket.BallSocketData>
         JMatrix cr1 = JMatrix.CreateCrossProduct(data.R1);
         JMatrix cr2 = JMatrix.CreateCrossProduct(data.R2);
 
-        data.EffectiveMass = body1.InverseMass * JMatrix.Identity +
-                             JMatrix.Multiply(cr1, JMatrix.MultiplyTransposed(body1.InverseInertiaWorld, cr1)) +
-                             body2.InverseMass * JMatrix.Identity +
-                             JMatrix.Multiply(cr2, JMatrix.MultiplyTransposed(body2.InverseInertiaWorld, cr2));
+        data.EffectiveMass = (JSymmetricMatrix.CreateScale(body1.InverseMassVector) +
+                              JSymmetricMatrix.Transform(body1.InverseInertiaWorld, cr1) +
+                              JSymmetricMatrix.CreateScale(body2.InverseMassVector) +
+                              JSymmetricMatrix.Transform(body2.InverseInertiaWorld, cr2)).ToMatrix();
 
-        Real softness = data.Softness * idt;
+        Real softness = data.Softness * timeStep.InverseSubstepDt;
 
         data.EffectiveMass.M11 += softness;
         data.EffectiveMass.M22 += softness;
         data.EffectiveMass.M33 += softness;
 
-        JMatrix.Inverse(data.EffectiveMass, out data.EffectiveMass);
+        data.EffectiveMass = MathHelper.InverseSymmetric(data.EffectiveMass);
 
-        data.Bias = (p2 - p1) * data.BiasFactor * idt;
+        data.Bias = (p2 - p1) * data.BiasFactor * timeStep.InverseStepDt;
 
         JVector acc = data.AccumulatedImpulse;
 
-        body1.Velocity -= body1.InverseMass * acc;
-        body1.AngularVelocity -= JVector.Transform(JVector.Transform(acc, cr1), body1.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity -= JVector.Multiply(acc, body1.InverseMassVector);
+            body1.AngularVelocity -= JVector.Transform(JVector.Transform(acc, cr1), body1.InverseInertiaWorld);
+        }
 
-        body2.Velocity += body2.InverseMass * acc;
-        body2.AngularVelocity += JVector.Transform(JVector.Transform(acc, cr2), body2.InverseInertiaWorld);
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(acc, body2.InverseMassVector);
+            body2.AngularVelocity += JVector.Transform(JVector.Transform(acc, cr2), body2.InverseInertiaWorld);
+        }
     }
 
     /// <summary>
     /// Gets or sets the softness (compliance) of the constraint.
     /// </summary>
     /// <value>
-    /// Default is 0. Higher values allow more positional error but improve stability.
+    /// Default is <see cref="Constraint.DefaultLinearSoftness"/>. Higher values allow more positional error but improve stability.
     /// Scaled by inverse timestep during solving.
     /// </value>
     public Real Softness
     {
         get => Data.Softness;
-        set => Data.Softness = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.Softness = value;
+        }
     }
 
     /// <summary>
     /// Gets or sets the bias factor controlling how aggressively positional error is corrected.
     /// </summary>
     /// <value>
-    /// Default is 0.2. Range [0, 1]. Higher values correct errors faster but may cause instability.
+    /// Default is 0.2. Higher values correct errors faster but may cause instability.
     /// </value>
     public Real Bias
     {
         get => Data.BiasFactor;
-        set => Data.BiasFactor = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.BiasFactor = value;
+        }
     }
 
     /// <summary>
-    /// Gets the accumulated impulse applied by this constraint during the last step.
+    /// Gets the accumulated solver impulse from the last solved substep.
     /// </summary>
     public JVector Impulse => Data.AccumulatedImpulse;
 
-    public static void IterateBallSocket(ref ConstraintData constraint, Real idt)
+    public static void IterateBallSocket(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, BallSocketData>(ref constraint);
         ref RigidBodyData body1 = ref constraint.Body1.Data;
@@ -205,7 +230,7 @@ public unsafe class BallSocket : Constraint<BallSocket.BallSocketData>
         JMatrix cr1 = JMatrix.CreateCrossProduct(data.R1);
         JMatrix cr2 = JMatrix.CreateCrossProduct(data.R2);
 
-        JVector softnessVector = data.AccumulatedImpulse * data.Softness * idt;
+        JVector softnessVector = data.AccumulatedImpulse * data.Softness * timeStep.InverseSubstepDt;
 
         JVector jv = -body1.Velocity + JVector.Transform(body1.AngularVelocity, cr1) + body2.Velocity -
                      JVector.Transform(body2.AngularVelocity, cr2);
@@ -214,28 +239,31 @@ public unsafe class BallSocket : Constraint<BallSocket.BallSocketData>
 
         data.AccumulatedImpulse += lambda;
 
-        body1.Velocity -= body1.InverseMass * lambda;
-        body1.AngularVelocity -= JVector.Transform(JVector.Transform(lambda, cr1), body1.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity -= JVector.Multiply(lambda, body1.InverseMassVector);
+            body1.AngularVelocity -= JVector.Transform(JVector.Transform(lambda, cr1), body1.InverseInertiaWorld);
+        }
 
-        body2.Velocity += body2.InverseMass * lambda;
-        body2.AngularVelocity += JVector.Transform(JVector.Transform(lambda, cr2), body2.InverseInertiaWorld);
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(lambda, body2.InverseMassVector);
+            body2.AngularVelocity += JVector.Transform(JVector.Transform(lambda, cr2), body2.InverseInertiaWorld);
+        }
     }
 
-    public override void DebugDraw(IDebugDrawer drawer)
+    public override void DebugDraw(IDebugDrawer drawer) => DebugDraw(drawer, DebugDrawSettings.Default);
+
+    /// <inheritdoc />
+    public override void DebugDraw(IDebugDrawer drawer, in DebugDrawSettings settings)
     {
-        ref BallSocketData data = ref Data;
-        ref RigidBodyData body1 = ref data.Body1.Data;
-        ref RigidBodyData body2 = ref data.Body2.Data;
-
-        JVector.Transform(data.LocalAnchor1, body1.Orientation, out JVector r1);
-        JVector.Transform(data.LocalAnchor2, body2.Orientation, out JVector r2);
-
-        JVector p1 = body1.Position + r1;
-        JVector p2 = body2.Position + r2;
-
-        drawer.DrawSegment(body1.Position, p1);
-        drawer.DrawSegment(body2.Position, p2);
-        drawer.DrawPoint(p1);
-        drawer.DrawPoint(p2);
+        ArgumentNullException.ThrowIfNull(drawer);
+        VerifyNotZero();
+        JVector first = Anchor1, second = Anchor2;
+        if (Body1 != Body1.World.NullBody) drawer.DrawSegment(Body1.Position, first, settings.ReferenceColor);
+        if (Body2 != Body2.World.NullBody) drawer.DrawSegment(Body2.Position, second, settings.CurrentColor);
+        drawer.DrawSegment(first, second, settings.CurrentColor);
+        drawer.DrawPoint(first, settings.PointRadius, settings.ReferenceColor);
+        drawer.DrawPoint(second, settings.PointRadius, settings.CurrentColor);
     }
 }

@@ -148,10 +148,36 @@ public class WorldTests
     }
 
     [TestCase]
+    public void Step_NonFiniteDt_Throws()
+    {
+        using var world = new World();
+
+        Assert.Throws<ArgumentException>(() => world.Step(Real.NaN, false));
+        Assert.Throws<ArgumentException>(() => world.Step(Real.PositiveInfinity, false));
+        Assert.Throws<ArgumentException>(() => world.Step(Real.NegativeInfinity, false));
+    }
+
+    [TestCase]
     public void Step_WithNoBody_DoesNotThrow()
     {
         var world = new World();
         Assert.DoesNotThrow(() => world.Step(1f / 60f, false));
+        world.Dispose();
+    }
+
+    [TestCase]
+    public void Step_WhenInterrupted_PausesThreadPool()
+    {
+        var world = new World();
+        world.PreStep += _ =>
+        {
+            Assert.That(Jitter2.Parallelization.ThreadPool.Instance.IsPaused, Is.False);
+            throw new InvalidOperationException("Interrupted step.");
+        };
+
+        Assert.Throws<InvalidOperationException>(() => world.Step(1f / 60f, true));
+
+        Assert.That(Jitter2.Parallelization.ThreadPool.Instance.IsPaused, Is.True);
         world.Dispose();
     }
 
@@ -172,6 +198,25 @@ public class WorldTests
     }
 
     [TestCase]
+    public void Stabilize_NonFiniteDt_Throws()
+    {
+        using var world = new World();
+
+        Assert.Throws<ArgumentException>(() => world.Stabilize(Real.NaN, 1, 0, false));
+        Assert.Throws<ArgumentException>(() => world.Stabilize(Real.PositiveInfinity, 1, 0, false));
+        Assert.Throws<ArgumentException>(() => world.Stabilize(Real.NegativeInfinity, 1, 0, false));
+    }
+
+    [TestCase]
+    public void Stabilize_ZeroDt_StillValidatesIterationCounts()
+    {
+        using var world = new World();
+
+        Assert.Throws<ArgumentException>(() => world.Stabilize(0, 0, 0, false));
+        Assert.Throws<ArgumentException>(() => world.Stabilize(0, 1, -1, false));
+    }
+
+    [TestCase]
     public void Stabilize_SolverIterationsBelowOne_Throws()
     {
         var world = new World();
@@ -184,6 +229,32 @@ public class WorldTests
     {
         var world = new World();
         Assert.Throws<ArgumentException>(() => world.Stabilize(1f / 60f, 1, -1, false));
+        world.Dispose();
+    }
+
+    [TestCase]
+    public void Stabilize_WhenInterrupted_PausesThreadPool()
+    {
+        var world = new World
+        {
+            Gravity = JVector.Zero
+        };
+
+        var body = world.CreateRigidBody();
+        body.AddShape(new BoxShape(1));
+        body.DeactivationTime = TimeSpan.Zero;
+
+        world.Step(1f / 60f, false);
+
+        world.IslandDeactivated += _ =>
+        {
+            Assert.That(Jitter2.Parallelization.ThreadPool.Instance.IsPaused, Is.False);
+            throw new InvalidOperationException("Interrupted stabilize.");
+        };
+
+        Assert.Throws<InvalidOperationException>(() => world.Stabilize(1f / 60f, 1, 0, true));
+
+        Assert.That(Jitter2.Parallelization.ThreadPool.Instance.IsPaused, Is.True);
         world.Dispose();
     }
 
@@ -258,7 +329,7 @@ public class WorldTests
     {
         var world = new World();
         Real receivedDt = 0;
-        world.PreStep += dt => receivedDt = dt;
+        world.PreStep += dt => receivedDt = dt.StepDt;
         const Real expectedDt = 1f / 60f;
         world.Step(expectedDt, false);
         Assert.That(receivedDt, Is.EqualTo(expectedDt).Within(1e-6f));

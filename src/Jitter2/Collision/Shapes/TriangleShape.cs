@@ -6,6 +6,7 @@
 
 using System;
 using System.Collections.Generic;
+using Jitter2.Dynamics;
 using Jitter2.LinearMath;
 
 namespace Jitter2.Collision.Shapes;
@@ -24,6 +25,14 @@ public class TriangleShape : RigidBodyShape
     /// The index representing the position of the triangle within the mesh.
     /// </summary>
     public readonly int Index;
+
+    /// <inheritdoc/>
+    protected internal override void DebugDrawLocal<TSink>(ref TSink triangleSink, in DebugDrawSettings settings)
+    {
+        ref readonly var triangle = ref Mesh.Indices[Index];
+        triangleSink.Add(new JTriangle(Mesh.Vertices[triangle.IndexA],
+            Mesh.Vertices[triangle.IndexB], Mesh.Vertices[triangle.IndexC]));
+    }
 
     /// <summary>
     /// Initializes a new instance of the TriangleShape class.
@@ -49,8 +58,7 @@ public class TriangleShape : RigidBodyShape
     }
 
     /// <summary>
-    /// Creates and returns all instances of type <see cref="TriangleShape"/>
-    /// for as given <see cref="TriangleMesh"/>.
+    /// Creates one shape for each triangle in the mesh.
     /// </summary>
     public static IEnumerable<TriangleShape> CreateAllShapes(TriangleMesh mesh)
     {
@@ -63,15 +71,16 @@ public class TriangleShape : RigidBodyShape
     /// <exception cref="NotSupportedException">
     /// Always thrown because a triangle has no volume and therefore no mass properties.
     /// </exception>
-    public override void CalculateMassInertia(out JMatrix inertia, out JVector com, out Real mass)
+    public override void CalculateMassInertia(out JSymmetricMatrix inertia, out JVector com, out Real mass)
     {
         throw new NotSupportedException($"{nameof(TriangleShape)} has no mass properties. " +
                                         $"If you encounter this while calling RigidBody.AddShape, " +
-                                        $"call AddShape with setMassInertia set to false.");
+                                        $"call AddShape with massInertiaMode set to {nameof(MassInertiaUpdateMode.Preserve)}.");
     }
 
     /// <summary>
-    /// Gets the vertices transformed to world space coordinates, as affected by the rigid body's transformation.
+    /// Gets the vertices transformed by the attached rigid body. If the shape is unattached,
+    /// returns the mesh vertices without a world transform.
     /// </summary>
     /// <param name="a">The transformed coordinate of the first vertex.</param>
     /// <param name="b">The transformed coordinate of the second vertex.</param>
@@ -124,6 +133,7 @@ public class TriangleShape : RigidBodyShape
     }
 
     /// <inheritdoc/>
+    /// <remarks>Back-facing triangles are culled.</remarks>
     public override bool LocalRayCast(in JVector origin, in JVector direction, out JVector normal, out Real lambda)
     {
         ref readonly var meshTriangle = ref Mesh.Indices[Index];
@@ -131,7 +141,13 @@ public class TriangleShape : RigidBodyShape
         var triangle = new JTriangle(Mesh.Vertices[meshTriangle.IndexA],
             Mesh.Vertices[meshTriangle.IndexB], Mesh.Vertices[meshTriangle.IndexC]);
 
-        return triangle.RayIntersect(origin, direction, JTriangle.CullMode.BackFacing, out normal, out lambda);
+        if (triangle.RayIntersect(origin, direction, JTriangle.CullMode.BackFacing, out normal, out lambda) &&
+            lambda >= (Real)0.0) return true;
+
+        // RayIntersect tests the whole line, so a hit behind the origin is a miss for a ray.
+        normal = JVector.Zero;
+        lambda = Real.MaxValue;
+        return false;
     }
 
     /// <inheritdoc/>
@@ -144,6 +160,35 @@ public class TriangleShape : RigidBodyShape
         JVector c = Mesh.Vertices[triangle.IndexC];
 
         point = (Real)(1.0 / 3.0) * (a + b + c);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// A vertex belongs to the feature if tilting the direction by the tolerance angle can raise it
+    /// to the highest vertex: the whole triangle near its normal, an edge near the normals of the
+    /// edge, otherwise a single vertex.
+    /// </remarks>
+    public override int SupportFeature(in JVector direction, Real tolerance, Span<JVector> vertices)
+    {
+        ref readonly var triangle = ref Mesh.Indices[Index];
+
+        JVector a = Mesh.Vertices[triangle.IndexA];
+        JVector b = Mesh.Vertices[triangle.IndexB];
+        JVector c = Mesh.Vertices[triangle.IndexC];
+
+        Real da = JVector.Dot(a, direction);
+        Real db = JVector.Dot(b, direction);
+        Real dc = JVector.Dot(c, direction);
+
+        Real max = MathR.Max(da, MathR.Max(db, dc));
+        JVector top = da == max ? a : db == max ? b : c;
+        Real slack = tolerance * direction.Length();
+
+        int count = 0;
+        if (max - da <= slack * (a - top).Length()) vertices[count++] = a;
+        if (max - db <= slack * (b - top).Length()) vertices[count++] = b;
+        if (max - dc <= slack * (c - top).Length()) vertices[count++] = c;
+        return count;
     }
 
     /// <inheritdoc/>

@@ -60,7 +60,15 @@ public class RenderWindow : GLFWWindow
     public override void Load()
     {
         GuiRenderer = new GuiRenderer();
-        Gui = new Ui(GuiRenderer) { DefaultFontSize = 18f, Lcd = true, Platform = new UiPlatform(this) };
+        Gui = new Ui(GuiRenderer)
+        {
+            DefaultFontSize = 18f,
+            FontStack = UiFont.Merge(
+                UiFont.Source(UiFonts.DefaultSans),
+                UiFont.Source(MaterialSymbols.Font, offsetY: 2f)),
+            Lcd = true,
+            Platform = new UiPlatform(this)
+        };
         Gui.Theme.SurfaceBg = Color.Transparent;
         
         Shadow = new ShadowCaster();

@@ -16,6 +16,12 @@ public class SphereShape : RigidBodyShape
 {
     private Real radius;
 
+    /// <inheritdoc/>
+    protected internal override void DebugDrawLocal<TSink>(ref TSink triangleSink, in DebugDrawSettings settings)
+    {
+        ShapeDebugDraw.Capsule(ref triangleSink, radius, 0, settings.Segments);
+    }
+
     /// <summary>
     /// Gets or sets the radius of the sphere.
     /// </summary>
@@ -27,8 +33,7 @@ public class SphereShape : RigidBodyShape
         get => radius;
         set
         {
-            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, nameof(Radius));
-            radius = value;
+            radius = ArgumentCheck.Positive(value, nameof(Radius));
             UpdateWorldBoundingBox();
         }
     }
@@ -42,9 +47,7 @@ public class SphereShape : RigidBodyShape
     /// </exception>
     public SphereShape(Real radius = (Real)1.0)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(radius);
-
-        this.radius = radius;
+        this.radius = ArgumentCheck.Positive(radius, nameof(radius));
         UpdateWorldBoundingBox();
     }
 
@@ -52,6 +55,14 @@ public class SphereShape : RigidBodyShape
     {
         result = JVector.Normalize(direction);
         JVector.Multiply(result, radius, out result);
+    }
+
+    /// <inheritdoc/>
+    public override int SupportFeature(in JVector direction, Real tolerance, Span<JVector> vertices)
+    {
+        // A sphere touches at a single point.
+        SupportMap(direction, out vertices[0]);
+        return 1;
     }
 
     public override void GetCenter(out JVector point)
@@ -94,12 +105,12 @@ public class SphereShape : RigidBodyShape
         return t1 > (Real)0.0;
     }
 
-    public override void CalculateMassInertia(out JMatrix inertia, out JVector com, out Real mass)
+    public override void CalculateMassInertia(out JSymmetricMatrix inertia, out JVector com, out Real mass)
     {
         mass = (Real)(4.0 / 3.0) * MathR.PI * radius * radius * radius;
 
         // (0,0,0) is the center of mass
-        inertia = JMatrix.Identity;
+        inertia = JSymmetricMatrix.Identity;
         inertia.M11 = (Real)(2.0 / 5.0) * mass * radius * radius;
         inertia.M22 = (Real)(2.0 / 5.0) * mass * radius * radius;
         inertia.M33 = (Real)(2.0 / 5.0) * mass * radius * radius;

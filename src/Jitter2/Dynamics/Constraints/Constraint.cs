@@ -5,9 +5,11 @@
  */
 
 using System;
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
+using Jitter2.LinearMath;
 using Jitter2.Unmanaged;
 
 namespace Jitter2.Dynamics.Constraints;
@@ -43,17 +45,17 @@ public unsafe struct SmallConstraintData
     public readonly bool IsEnabled => DispatchId != 0;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly void PrepareForIteration(ref SmallConstraintData constraint, Real idt)
+    public readonly void PrepareForIteration(ref SmallConstraintData constraint, in TimeStep timeStep)
     {
         ref readonly var dispatch = ref ConstraintDispatchTable.Get(DispatchId);
-        ((delegate*<ref SmallConstraintData, Real, void>)dispatch.Prepare)(ref constraint, idt);
+        ((delegate*<ref SmallConstraintData, in TimeStep, void>)dispatch.Prepare)(ref constraint, timeStep);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly void Iterate(ref SmallConstraintData constraint, Real idt)
+    public readonly void Iterate(ref SmallConstraintData constraint, in TimeStep timeStep)
     {
         ref readonly var dispatch = ref ConstraintDispatchTable.Get(DispatchId);
-        ((delegate*<ref SmallConstraintData, Real, void>)dispatch.Iterate)(ref constraint, idt);
+        ((delegate*<ref SmallConstraintData, in TimeStep, void>)dispatch.Iterate)(ref constraint, timeStep);
     }
 }
 
@@ -88,17 +90,17 @@ public unsafe struct ConstraintData
     public readonly bool IsEnabled => DispatchId != 0;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly void PrepareForIteration(ref ConstraintData constraint, Real idt)
+    public readonly void PrepareForIteration(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref readonly var dispatch = ref ConstraintDispatchTable.Get(DispatchId);
-        ((delegate*<ref ConstraintData, Real, void>)dispatch.Prepare)(ref constraint, idt);
+        ((delegate*<ref ConstraintData, in TimeStep, void>)dispatch.Prepare)(ref constraint, timeStep);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly void Iterate(ref ConstraintData constraint, Real idt)
+    public readonly void Iterate(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref readonly var dispatch = ref ConstraintDispatchTable.Get(DispatchId);
-        ((delegate*<ref ConstraintData, Real, void>)dispatch.Iterate)(ref constraint, idt);
+        ((delegate*<ref ConstraintData, in TimeStep, void>)dispatch.Iterate)(ref constraint, timeStep);
     }
 }
 
@@ -111,50 +113,55 @@ internal static unsafe class ConstraintDispatchTable
     }
 
     private static readonly object Sync = new();
-    private static readonly List<Entry> Entries = [default];
+    private static Entry[] entries = [default];
 
     public static uint Register(
-        delegate*<ref ConstraintData, Real, void> prepare,
-        delegate*<ref ConstraintData, Real, void> iterate)
+        delegate*<ref ConstraintData, in TimeStep, void> prepare,
+        delegate*<ref ConstraintData, in TimeStep, void> iterate)
     {
         if (prepare == null) throw new ArgumentNullException(nameof(prepare));
         if (iterate == null) throw new ArgumentNullException(nameof(iterate));
 
         lock (Sync)
         {
-            if (Entries.Count == int.MaxValue)
-            {
-                throw new InvalidOperationException("Too many registered constraint dispatch entries.");
-            }
-
-            Entries.Add(new Entry((nint)prepare, (nint)iterate));
-            return (uint)(Entries.Count - 1);
+            return Register((nint)prepare, (nint)iterate);
         }
     }
 
     public static uint Register(
-        delegate*<ref SmallConstraintData, Real, void> prepare,
-        delegate*<ref SmallConstraintData, Real, void> iterate)
+        delegate*<ref SmallConstraintData, in TimeStep, void> prepare,
+        delegate*<ref SmallConstraintData, in TimeStep, void> iterate)
     {
         if (prepare == null) throw new ArgumentNullException(nameof(prepare));
         if (iterate == null) throw new ArgumentNullException(nameof(iterate));
 
         lock (Sync)
         {
-            if (Entries.Count == int.MaxValue)
-            {
-                throw new InvalidOperationException("Too many registered constraint dispatch entries.");
-            }
-
-            Entries.Add(new Entry((nint)prepare, (nint)iterate));
-            return (uint)(Entries.Count - 1);
+            return Register((nint)prepare, (nint)iterate);
         }
+    }
+
+    private static uint Register(nint prepare, nint iterate)
+    {
+        Entry[] current = entries;
+        if (current.Length == int.MaxValue)
+        {
+            throw new InvalidOperationException("Too many registered constraint dispatch entries.");
+        }
+
+        Entry[] next = new Entry[current.Length + 1];
+        Array.Copy(current, next, current.Length);
+        next[current.Length] = new Entry(prepare, iterate);
+
+        Volatile.Write(ref entries, next);
+        return (uint)current.Length;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ref readonly Entry Get(uint dispatchId)
     {
-        return ref CollectionsMarshal.AsSpan(Entries)[(int)dispatchId];
+        Entry[] table = Volatile.Read(ref entries);
+        return ref table[(int)dispatchId];
     }
 }
 
@@ -174,7 +181,14 @@ public abstract class Constraint<T> : Constraint where T : unmanaged
     /// <summary>
     /// Gets a reference to the constraint's typed data stored in unmanaged memory.
     /// </summary>
-    public ref T Data => ref JHandle<ConstraintData>.AsHandle<T>(Handle).Data;
+    public ref T Data
+    {
+        get
+        {
+            Debug.Assert(IsValid);
+            return ref JHandle<ConstraintData>.AsHandle<T>(Handle).Data;
+        }
+    }
 
     /// <inheritdoc />
     public override unsafe bool IsSmallConstraint => sizeof(T) <= sizeof(SmallConstraintData);
@@ -219,6 +233,11 @@ public abstract class Constraint : IDebugDrawable
     /// <summary>Gets the second rigid body connected by this constraint.</summary>
     public RigidBody Body2 { private set; get; } = null!;
 
+    /// <summary>
+    /// Gets or sets application data associated with this constraint. The engine does not use this value.
+    /// </summary>
+    public object? Tag { get; set; }
+
     /// <summary>Gets whether this constraint uses the smaller data layout.</summary>
     public virtual bool IsSmallConstraint { get; } = false;
 
@@ -226,6 +245,27 @@ public abstract class Constraint : IDebugDrawable
     /// A handle for accessing the raw constraint data.
     /// </summary>
     public JHandle<ConstraintData> Handle { internal set; get; }
+
+    /// <summary>
+    /// Gets a value indicating whether the underlying constraint data is still valid.
+    /// </summary>
+    public bool IsValid => !Handle.IsZero && !Body1.World.IsDisposed;
+
+    /// <summary>Returns a short description of the constraint's ID, connected bodies, and state.</summary>
+    public override string ToString() => FormatDescription(nameof(Constraint));
+
+    /// <summary>Formats the constraint's ID, connected body IDs, and state using the supplied name.</summary>
+    /// <param name="name">The constraint type name to display.</param>
+    protected string FormatDescription(string name)
+    {
+        if (Body1 == null || Body2 == null) return $"{name} {{ Uninitialized }}";
+
+        string bodies = $"Body1={Body1.RigidBodyId}, Body2={Body2.RigidBodyId}";
+        if (!IsValid) return $"{name} {{ {bodies}, Invalid }}";
+
+        ref ConstraintData data = ref Handle.Data;
+        return $"{name} {{ Id={data.ConstraintId}, {bodies}, IsEnabled={data.IsEnabled} }}";
+    }
 
     /// <summary>
     /// Gets a handle to the constraint data reinterpreted as <see cref="SmallConstraintData"/>.
@@ -257,27 +297,25 @@ public abstract class Constraint : IDebugDrawable
         if (Handle.IsZero)
         {
             throw new InvalidOperationException(
-                $"The constraint has not been created by the world. " +
-                $"Use World.CreateConstraint<{GetType().Name}>() to create constraints.");
+                "The constraint has not been created by the world. " +
+                "Use World.CreateConstraint<T>() to create constraints.");
         }
     }
 
     /// <summary>
-    /// Sets the solver dispatch id used by this instance. Override this in derived classes
-    /// to assign the correct registered solver pair. The id is later written into the
-    /// unmanaged header when the constraint is enabled.
+    /// Called when the world creates this constraint. Override to set <see cref="DispatchId"/>
+    /// to the ID returned by registering the constraint's solver methods.
     /// </summary>
     protected virtual void Create()
     {
     }
 
     /// <summary>
-    /// Resets the cached warm-start state used by the solver for this constraint.
+    /// Clears impulses saved from the previous solve, without changing constraint settings.
     /// </summary>
     /// <remarks>
-    /// This clears only persistent solver impulses. Constraint configuration remains unchanged.
-    /// Useful after restoring snapshots or other discontinuous state changes where preserving
-    /// warm-starting is undesirable.
+    /// Use after restoring a saved state or making a sudden change to the bodies,
+    /// when impulses from their previous state should no longer be reused.
     /// </remarks>
     public virtual void ResetWarmStart()
     {
@@ -286,15 +324,15 @@ public abstract class Constraint : IDebugDrawable
     protected uint DispatchId { get; set; }
 
     protected static unsafe uint RegisterFullConstraint(
-        delegate*<ref ConstraintData, Real, void> prepare,
-        delegate*<ref ConstraintData, Real, void> iterate)
+        delegate*<ref ConstraintData, in TimeStep, void> prepare,
+        delegate*<ref ConstraintData, in TimeStep, void> iterate)
     {
         return ConstraintDispatchTable.Register(prepare, iterate);
     }
 
     protected static unsafe uint RegisterSmallConstraint(
-        delegate*<ref SmallConstraintData, Real, void> prepare,
-        delegate*<ref SmallConstraintData, Real, void> iterate)
+        delegate*<ref SmallConstraintData, in TimeStep, void> prepare,
+        delegate*<ref SmallConstraintData, in TimeStep, void> iterate)
     {
         return ConstraintDispatchTable.Register(prepare, iterate);
     }
@@ -304,12 +342,20 @@ public abstract class Constraint : IDebugDrawable
     /// </summary>
     /// <remarks>
     /// Use <see cref="World.Remove(Constraint)"/> for permanent removal.
+    /// An enabled constraint is solved only while at least one connected body is dynamic and awake.
+    /// Changing body motion types or activation states does not change this property.
     /// </remarks>
     public unsafe bool IsEnabled
     {
-        get => Handle.Data.DispatchId != 0;
+        get
+        {
+            Debug.Assert(IsValid);
+            return Handle.Data.DispatchId != 0;
+        }
         set
         {
+            Debug.Assert(IsValid);
+
             if (value && DispatchId == 0)
             {
                 throw new InvalidOperationException(
@@ -350,4 +396,14 @@ public abstract class Constraint : IDebugDrawable
     {
         throw new NotImplementedException();
     }
+
+    /// <summary>
+    /// Draws this constraint using the supplied visualization settings.
+    /// Custom constraints that only override <see cref="DebugDraw(IDebugDrawer)"/> use their default visualization.
+    /// </summary>
+    public virtual void DebugDraw(IDebugDrawer drawer, in DebugDrawSettings settings) => DebugDraw(drawer);
+
+    /// <summary>Gets the display origin for an angular constraint, keeping world-relative guides near body 2.</summary>
+    protected JVector GetDebugDrawOrigin(in DebugDrawSettings settings) =>
+        settings.Origin ?? (Body1 == Body1.World.NullBody ? Body2.Position : Body1.Position);
 }

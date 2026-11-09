@@ -13,14 +13,8 @@ using Jitter2.LinearMath;
 namespace Jitter2.Collision;
 
 /// <summary>
-/// Represents an axis-aligned bounding box with SIMD-friendly memory layout, used for spatial partitioning in
-/// acceleration structures such as <see cref="DynamicTree"/>.
+/// An axis-aligned bounding box used by <see cref="DynamicTree"/>.
 /// </summary>
-/// <remarks>
-/// The struct is explicitly laid out to occupy exactly 8 <see cref="Real"/> fields, enabling efficient SIMD operations and
-/// binary comparisons. It contains both minimum and maximum corners of the box as <see cref="JVector"/>, along with
-/// unused W components (<c>MinW</c>, <c>MaxW</c>) to match memory alignment.
-/// </remarks>
 /// <seealso cref="JBoundingBox"/>
 /// <seealso cref="JVector"/>
 [StructLayout(LayoutKind.Explicit, Size = 8 * sizeof(Real))]
@@ -104,7 +98,7 @@ public struct TreeBox : IEquatable<TreeBox>
     /// </summary>
     /// <param name="box">The box to check against.</param>
     /// <returns><c>true</c> if the boxes overlap; <c>false</c> if they are completely separated.</returns>
-    [Obsolete($"Use !{nameof(Disjoint)} instead.")]
+    [Obsolete($"Use !{nameof(Disjoint)} instead.", true)]
     public readonly bool NotDisjoint(in JBoundingBox box)
     {
         return Max.X >= box.Min.X && Min.X <= box.Max.X && Max.Y >= box.Min.Y && Min.Y <= box.Max.Y &&
@@ -137,31 +131,11 @@ public struct TreeBox : IEquatable<TreeBox>
     /// Determines whether this box completely encloses the specified box.
     /// </summary>
     /// <remarks>This is an alias for <see cref="Contains(in JBoundingBox)"/>.</remarks>
-    [Obsolete($"Use {nameof(Contains)} instead.")]
+    [Obsolete($"Use {nameof(Contains)} instead.", true)]
     public readonly bool Encompasses(in JBoundingBox box)
     {
         return Min.X <= box.Min.X && Max.X >= box.Max.X && Min.Y <= box.Min.Y && Max.Y >= box.Max.Y &&
                Min.Z <= box.Min.Z && Max.Z >= box.Max.Z;
-    }
-
-    private static bool Intersect1D(Real start, Real dir, Real min, Real max,
-        ref Real enter, ref Real exit)
-    {
-        if (dir * dir < Epsilon * Epsilon) return start >= min && start <= max;
-
-        Real t0 = (min - start) / dir;
-        Real t1 = (max - start) / dir;
-
-        if (t0 > t1)
-        {
-            (t0, t1) = (t1, t0);
-        }
-
-        if (t0 > exit || t1 < enter) return false;
-
-        if (t0 > enter) enter = t0;
-        if (t1 < exit) exit = t1;
-        return true;
     }
 
     /// <summary>
@@ -170,21 +144,8 @@ public struct TreeBox : IEquatable<TreeBox>
     /// <param name="origin">The start point of the segment.</param>
     /// <param name="direction">The vector defining the direction and length of the segment (End Point = Origin + Direction).</param>
     /// <returns><c>true</c> if the segment passes through the box; otherwise, <c>false</c>.</returns>
-    public readonly bool SegmentIntersect(in JVector origin, in JVector direction)
-    {
-        Real enter = (Real)0.0, exit = (Real)1.0;
-
-        if (!Intersect1D(origin.X, direction.X, Min.X, Max.X, ref enter, ref exit))
-            return false;
-
-        if (!Intersect1D(origin.Y, direction.Y, Min.Y, Max.Y, ref enter, ref exit))
-            return false;
-
-        if (!Intersect1D(origin.Z, direction.Z, Min.Z, Max.Z, ref enter, ref exit))
-            return false;
-
-        return true;
-    }
+    public readonly bool SegmentIntersect(in JVector origin, in JVector direction) =>
+        JBoundingBox.IntersectSlabs(Min, Max, origin, direction, (Real)1.0, out _);
 
     /// <summary>
     /// Checks if an infinite ray intersects this bounding box.
@@ -192,21 +153,8 @@ public struct TreeBox : IEquatable<TreeBox>
     /// <param name="origin">The origin of the ray.</param>
     /// <param name="direction">The direction of the ray (not necessarily normalized).</param>
     /// <returns><c>true</c> if the ray intersects the box; otherwise, <c>false</c>.</returns>
-    public readonly bool RayIntersect(in JVector origin, in JVector direction)
-    {
-        Real enter = (Real)0.0, exit = Real.MaxValue;
-
-        if (!Intersect1D(origin.X, direction.X, Min.X, Max.X, ref enter, ref exit))
-            return false;
-
-        if (!Intersect1D(origin.Y, direction.Y, Min.Y, Max.Y, ref enter, ref exit))
-            return false;
-
-        if (!Intersect1D(origin.Z, direction.Z, Min.Z, Max.Z, ref enter, ref exit))
-            return false;
-
-        return true;
-    }
+    public readonly bool RayIntersect(in JVector origin, in JVector direction) =>
+        JBoundingBox.IntersectSlabs(Min, Max, origin, direction, Real.MaxValue, out _);
 
     /// <summary>
     /// Checks if an infinite ray intersects this bounding box and calculates the entry distance.
@@ -215,22 +163,8 @@ public struct TreeBox : IEquatable<TreeBox>
     /// <param name="direction">The direction of the ray (not necessarily normalized).</param>
     /// <param name="enter">Outputs the scalar distance along the direction vector where the ray enters the box. If inside, this is 0.</param>
     /// <returns><c>true</c> if the ray intersects the box; otherwise, <c>false</c>.</returns>
-    public readonly bool RayIntersect(in JVector origin, in JVector direction, out Real enter)
-    {
-        enter = (Real)0.0;
-        Real exit = Real.MaxValue;
-
-        if (!Intersect1D(origin.X, direction.X, Min.X, Max.X, ref enter, ref exit))
-            return false;
-
-        if (!Intersect1D(origin.Y, direction.Y, Min.Y, Max.Y, ref enter, ref exit))
-            return false;
-
-        if (!Intersect1D(origin.Z, direction.Z, Min.Z, Max.Z, ref enter, ref exit))
-            return false;
-
-        return true;
-    }
+    public readonly bool RayIntersect(in JVector origin, in JVector direction, out Real enter) =>
+        JBoundingBox.IntersectSlabs(Min, Max, origin, direction, Real.MaxValue, out enter);
 
     public readonly override string ToString()
     {
@@ -286,7 +220,9 @@ public struct TreeBox : IEquatable<TreeBox>
         double ey = extent.GetElement(1);
         double ez = extent.GetElement(2);
 
-        return 2.0d * (ex * ey + ex * ez + ey * ez);
+        // Match GetSurfaceArea's arithmetic order so unchanged bounds have exactly zero
+        // cost change. Different rounding can otherwise make inverse rotations look cheaper.
+        return 2.0d * (ex * ey + ey * ez + ez * ex);
     }
 
     /// <summary>
@@ -311,7 +247,7 @@ public struct TreeBox : IEquatable<TreeBox>
     /// <param name="first">The first box.</param>
     /// <param name="second">The second box.</param>
     /// <returns><c>true</c> if the boxes intersect; <c>false</c> if they are disjoint.</returns>
-    [Obsolete($"Use !{nameof(Disjoint)} instead.")]
+    [Obsolete($"Use !{nameof(Disjoint)} instead.", true)]
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool NotDisjoint(in TreeBox first, in TreeBox second)
     {

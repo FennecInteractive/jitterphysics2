@@ -18,7 +18,7 @@ public class CollisionManifoldTests
         in JQuaternion orientationA, in JQuaternion orientationB,
         in JVector positionA, in JVector positionB,
         out JVector pointA, out JVector pointB, out JVector normal, out Real penetration)
-        where Ta : ISupportMappable where Tb : ISupportMappable
+        where Ta : ISupportFeature where Tb : ISupportFeature
     {
         bool hit = NarrowPhase.Collision(shapeA, shapeB, orientationA, orientationB, positionA, positionB,
             out pointA, out pointB, out normal, out penetration);
@@ -98,6 +98,73 @@ public class CollisionManifoldTests
         Assert.That(negativeXNegativeZ, Is.True);
     }
 
+    [TestCase(0.5, false)]
+    [TestCase(0.5, true)]
+    [TestCase(1.0, false)]
+    [TestCase(1.0, true)]
+    public void SphereAgainstFloor_PreservesOriginalContact(double radius, bool sphereFirst)
+    {
+        RigidBodyShape floor = new BoxShape(200, 200, 200);
+        RigidBodyShape sphere = new SphereShape((Real)radius);
+        JVector floorPosition = new(0, -100, 0);
+        JVector spherePosition = new(3, (Real)radius - (Real)0.005, -2);
+        JVector floorPoint = new(3, 0, -2);
+        JVector spherePoint = new(3, -(Real)0.005, -2);
+
+        CollisionManifold manifold = default;
+        manifold.BuildManifold(sphereFirst ? sphere : floor, sphereFirst ? floor : sphere,
+            JQuaternion.Identity, JQuaternion.Identity,
+            sphereFirst ? spherePosition : floorPosition, sphereFirst ? floorPosition : spherePosition,
+            sphereFirst ? spherePoint : floorPoint, sphereFirst ? floorPoint : spherePoint,
+            sphereFirst ? -JVector.UnitY : JVector.UnitY);
+
+        const Real epsilon = (Real)1e-5;
+        Assert.That(manifold.Count, Is.EqualTo(1));
+        Assert.That(JVector.MaxAbs(manifold.ManifoldA[0] - (sphereFirst ? spherePoint : floorPoint)),
+            Is.LessThan(epsilon));
+        Assert.That(JVector.MaxAbs(manifold.ManifoldB[0] - (sphereFirst ? floorPoint : spherePoint)),
+            Is.LessThan(epsilon));
+    }
+
+    // The resting line of a curved side is spanned exactly by its two ends. The original contact
+    // is not kept as a third point: it wanders along the line from step to step and would leave a
+    // cached contact behind a rolling cylinder.
+    [TestCase(0.5)]
+    [TestCase(1.0)]
+    public void CylinderAgainstFloor_ContactsAreTheEndsOfTheRestingLine(double radius)
+    {
+        BoxShape floor = new(200);
+        CylinderShape cylinder = new(2, (Real)radius);
+        JVector floorPosition = new(0, -100, 0);
+        JVector cylinderPosition = new(10, (Real)radius - (Real)0.005, 0);
+        JQuaternion cylinderOrientation = JQuaternion.CreateRotationZ(MathR.PI / 2);
+
+        bool hit = NarrowPhase.MprEpa(floor, cylinder,
+            JQuaternion.Identity, cylinderOrientation, floorPosition, cylinderPosition,
+            out JVector pointA, out JVector pointB, out JVector normal, out _);
+        Assert.That(hit, Is.True);
+
+        CollisionManifold manifold = default;
+        manifold.BuildManifold(floor, cylinder,
+            JQuaternion.Identity, cylinderOrientation, floorPosition, cylinderPosition,
+            pointA, pointB, normal);
+
+        const Real epsilon = (Real)1e-5;
+        Assert.That(manifold.Count, Is.EqualTo(2));
+        Assert.That(manifold.ManifoldA[0].X, Is.Not.EqualTo(manifold.ManifoldA[1].X).Within(epsilon));
+
+        for (int i = 0; i < 2; i++)
+        {
+            // On the floor plane, directly below the resting line, at the ends of the cylinder.
+            Assert.That(MathR.Abs(manifold.ManifoldA[i].X - cylinderPosition.X), Is.EqualTo((Real)1).Within(epsilon));
+            Assert.That(manifold.ManifoldA[i].Y, Is.EqualTo((Real)0).Within(epsilon));
+            Assert.That(manifold.ManifoldA[i].Z, Is.EqualTo((Real)0).Within(epsilon));
+            Assert.That(manifold.ManifoldB[i].X, Is.EqualTo(manifold.ManifoldA[i].X).Within(epsilon));
+            Assert.That(manifold.ManifoldB[i].Y, Is.EqualTo(-(Real)0.005).Within(epsilon));
+            Assert.That(manifold.ManifoldB[i].Z, Is.EqualTo((Real)0).Within(epsilon));
+        }
+    }
+
     [TestCase]
     public void EqualFaceBoxes_ProduceFourCornerContacts()
     {
@@ -125,6 +192,39 @@ public class CollisionManifoldTests
             Assert.That(MathR.Abs(MathR.Abs(mfA.Z) - (Real)1.0), Is.LessThan(epsilon));
             Assert.That(MathR.Abs(JVector.Dot(mfA - mfB, normal) - penetration), Is.LessThan(epsilon));
         }
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void TriangularFaceAgainstFloor_PreservesTriangleAndOriginalContact(bool prismFirst)
+    {
+        BoxShape floor = new(4, 2, 4);
+        VertexSupportMap prism = new([
+            new JVector(-1, -1, -1), new JVector(1, -1, -1), new JVector(0, -1, 1),
+            new JVector(-1, 1, -1), new JVector(1, 1, -1), new JVector(0, 1, 1)
+        ]);
+        JVector floorPosition = new(0, -1, 0);
+        JVector prismPosition = new(0, (Real)0.995, 0);
+        JVector floorPoint = JVector.Zero;
+        JVector prismPoint = new(0, -(Real)0.005, 0);
+
+        CollisionManifold manifold = default;
+        manifold.BuildManifold<ISupportFeature, ISupportFeature>(prismFirst ? prism : floor, prismFirst ? floor : prism,
+            JQuaternion.Identity, JQuaternion.Identity,
+            prismFirst ? prismPosition : floorPosition, prismFirst ? floorPosition : prismPosition,
+            prismFirst ? prismPoint : floorPoint, prismFirst ? floorPoint : prismPoint,
+            prismFirst ? -JVector.UnitY : JVector.UnitY);
+
+        const Real epsilon = (Real)1e-5;
+        Assert.That(manifold.Count, Is.EqualTo(4));
+        JVector[] floorContacts = prismFirst ? manifold.ManifoldB.ToArray() : manifold.ManifoldA.ToArray();
+        AssertSamePointSet([
+            new JVector(-1, 0, -1), new JVector(1, 0, -1), new JVector(0, 0, 1), floorPoint
+        ], floorContacts, epsilon * epsilon);
+        Assert.That(JVector.MaxAbs(manifold.ManifoldA[3] - (prismFirst ? prismPoint : floorPoint)),
+            Is.LessThan(epsilon));
+        Assert.That(JVector.MaxAbs(manifold.ManifoldB[3] - (prismFirst ? floorPoint : prismPoint)),
+            Is.LessThan(epsilon));
     }
 
     [TestCase]
@@ -232,8 +332,10 @@ public class CollisionManifoldTests
         AssertSamePointSet(expectedB, actualB, epsilon * epsilon);
     }
 
+    // A ridge rests on the face along a line, which its two endpoints span; the narrow phase's
+    // point somewhere on that line is not added.
     [TestCase]
-    public void BoxFaceAndRidge_ProduceLineSegmentEndpoints()
+    public void BoxFaceAndRidge_PreserveLineSegmentEndpoints()
     {
         SupportPrimitives.Box shapeA = SupportPrimitives.CreateBox(new JVector(2, 2, 2));
         VertexSupportMap shapeB = CreateRidgeSupport();
@@ -249,7 +351,7 @@ public class CollisionManifoldTests
         Assert.That(manifold.Count, Is.EqualTo(2));
         AssertUniqueContacts(manifold, epsilon * epsilon);
 
-        for (int i = 0; i < manifold.Count; i++)
+        for (int i = 0; i < 2; i++)
         {
             JVector mfA = manifold.ManifoldA[i];
             JVector mfB = manifold.ManifoldB[i];
@@ -263,7 +365,7 @@ public class CollisionManifoldTests
     }
 
     [TestCase]
-    public void RidgeAndBoxFace_ProduceLineSegmentEndpoints()
+    public void RidgeAndBoxFace_PreserveLineSegmentEndpoints()
     {
         VertexSupportMap shapeA = CreateRidgeSupport();
         SupportPrimitives.Box shapeB = SupportPrimitives.CreateBox(new JVector(2, 2, 2));
@@ -279,7 +381,7 @@ public class CollisionManifoldTests
         Assert.That(manifold.Count, Is.EqualTo(2));
         AssertUniqueContacts(manifold, epsilon * epsilon);
 
-        for (int i = 0; i < manifold.Count; i++)
+        for (int i = 0; i < 2; i++)
         {
             JVector mfA = manifold.ManifoldA[i];
             JVector mfB = manifold.ManifoldB[i];
@@ -291,5 +393,42 @@ public class CollisionManifoldTests
             Assert.That(MathR.Abs(mfA.Z), Is.LessThan(epsilon));
             Assert.That(MathR.Abs(mfB.Z), Is.LessThan(epsilon));
         }
+    }
+
+    // Two octagon caps yawed against each other intersect in sixteen points, the most two features
+    // of eight vertices can produce. A lower cap on the collected points dropped the intersections
+    // on the last edges of the first cap, so the reduced contacts covered only part of the rim and
+    // the upper cylinder tipped over the uncovered side.
+    [TestCase]
+    public void YawedCylinderCaps_ContactsCoverTheWholeRim()
+    {
+        CylinderShape lower = new(2, 1);
+        CylinderShape upper = new(2, 1);
+        JQuaternion yaw = JQuaternion.CreateRotationY(MathR.PI / 8);
+
+        CollisionManifold manifold = BuildManifold(lower, upper,
+            JQuaternion.Identity, yaw,
+            JVector.Zero, new JVector(0, (Real)1.995, 0),
+            out _, out _, out _, out _);
+
+        Assert.That(manifold.Count, Is.EqualTo(4));
+        AssertUniqueContacts(manifold, (Real)1e-6);
+
+        // Sorted by angle around the axis, no gap between neighbouring contacts may exceed a
+        // quarter turn by much.
+        Real[] angles = new Real[4];
+
+        for (int i = 0; i < 4; i++)
+        {
+            JVector p = manifold.ManifoldA[i];
+            Assert.That(MathR.Abs(p.Y - (Real)1.0), Is.LessThan((Real)1e-3));
+            angles[i] = (Real)Math.Atan2(p.Z, p.X);
+        }
+
+        Array.Sort(angles);
+        Real maxGap = angles[0] + (Real)2.0 * MathR.PI - angles[3];
+        for (int i = 1; i < 4; i++) maxGap = MathR.Max(maxGap, angles[i] - angles[i - 1]);
+
+        Assert.That(maxGap, Is.LessThan(MathR.PI / 2 + (Real)0.1));
     }
 }

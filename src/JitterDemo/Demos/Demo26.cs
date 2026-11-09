@@ -7,11 +7,11 @@ using JitterDemo.Renderer.OpenGL;
 
 namespace JitterDemo;
 
-public class Demo26 : IDemo, IDrawUpdate
+public class Demo26 : IDemo
 {
     public string Name => "Angular Sweep";
-    public string Description => "Visualizes NarrowPhase.Sweep with angular velocity.\n" +
-                                 "A rotating box sweeps toward a static bar, showing\n" +
+    public string Description => "Visualizes NarrowPhase.Sweep with angular velocity. " +
+                                 "A rotating box sweeps toward a static bar, showing " +
                                  "interpolated orientations up to the time of impact.";
     public string Controls => "O/P - Move sweep origin forward/backward";
 
@@ -24,7 +24,7 @@ public class Demo26 : IDemo, IDrawUpdate
     private JVector velocity = new JVector(0, 0, -10);
     private JVector angularVelocity = new JVector(1, 2,2);
 
-    public void Build(Playground pg, World world)
+    public void Build(Playground pg)
     {
         this.pg = pg;
         staticBar = new BoxShape(10,10,0.1f);

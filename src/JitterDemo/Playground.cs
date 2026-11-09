@@ -16,6 +16,7 @@ namespace JitterDemo;
 public class RigidBodyTag(bool doNotDraw = true)
 {
     public bool DoNotDraw { get; set; } = doNotDraw;
+    public Vector3? Color { get; set; }
 }
 
 // Built-in primitive drawables. Subclassing is the simplest way to key them in
@@ -99,23 +100,30 @@ public partial class Playground : RenderWindow
         new Demo23(),
         new Demo24(),
         new Demo25(),
-        new Demo26(), // angular sweep
+        // new Demo26(), // angular sweep
         new Demo27(),
         new Demo28(),
         new Demo29(),
         new Demo30(),
         new Demo31(),
+        new Demo32(),
+        new Demo33(),
+        new Demo34(),
+        // new Demo35(), // rolling
+        // new Demo36(), // trigger volumes
+        new Demo37(),
+        new Demo38(),
     };
 
     private IDemo? currentDemo;
 
     private void SwitchDemo(int index)
     {
-        (currentDemo as ICleanDemo)?.CleanUp();
+        currentDemo?.CleanUp();
         ResetScene();
         selectedDemoIndex = index;
         currentDemo = demos[index];
-        currentDemo.Build(this, world);
+        currentDemo.Build(this);
     }
 
     public Playground()
@@ -127,6 +135,7 @@ public partial class Playground : RenderWindow
 
     private void ResetScene()
     {
+        worldLabels.Clear();
         floorShape = null;
         world.Clear();
         world.DynamicTree.Filter = World.DefaultDynamicTreeFilter;
@@ -135,6 +144,7 @@ public partial class Playground : RenderWindow
         world.Gravity = new JVector(0, -9.81f, 0);
         world.SubstepCount = 1;
         world.SolverIterations = (8, 4);
+        world.ContactSettings = ContactSettings.Default;
     }
 
     public void AddFloor()
@@ -161,56 +171,7 @@ public partial class Playground : RenderWindow
 
         VerticalSync = false;
 
-        Gui.Theme = new Theme();
-        Gui.Theme.PanelBg = new Color(20, 20, 20, 80);
-        Gui.Theme.PanelBorder = new Color(156, 156, 156, 72);
-        Gui.Theme.ButtonBg = new Color(68, 68, 68, 120);
-        Gui.Theme.ButtonBgHover = new Color(92, 92, 92, 152);
-        Gui.Theme.ButtonBgPressed = new Color(60, 60, 60, 136);
-        Gui.Theme.ButtonBorder = new Color(148, 148, 148, 72);
-        Gui.Theme.ButtonBorderHover = new Color(188, 188, 188, 96);
-        Gui.Theme.ButtonBorderPressed = new Color(140, 140, 140, 84);
-        Gui.Theme.ToggleBg = new Color(72, 72, 72, 132);
-        Gui.Theme.ToggleBgHover = new Color(72, 104, 156, 176);
-        Gui.Theme.ToggleBgPressed = new Color(60, 90, 140, 188);
-        Gui.Theme.ToggleBgActive = new Color(88, 78, 58, 176);
-        Gui.Theme.ToggleBorder = new Color(148, 148, 148, 72);
-        Gui.Theme.ToggleBorderHover = new Color(154, 184, 224, 124);
-        Gui.Theme.ToggleBorderPressed = new Color(132, 166, 210, 132);
-        Gui.Theme.ToggleBorderActive = new Color(255, 200, 90, 216);
-        Gui.Theme.PlotBg = new Color(54, 84, 132, 108);
-        Gui.Theme.PlotBorder = new Color(136, 170, 222, 132);
-        Gui.Theme.PlotFill = new Color(255, 186, 52, 240);
-        Gui.Theme.SliderBg = new Color(40, 48, 60, 188);
-        Gui.Theme.SliderBgHover = new Color(48, 58, 72, 204);
-        Gui.Theme.SliderBgActive = new Color(34, 42, 54, 216);
-        Gui.Theme.SliderFill = new Color(77, 121, 186, 222);
-        Gui.Theme.SliderFillActive = new Color(96, 145, 216, 234);
-        Gui.Theme.SliderBorder = new Color(142, 152, 168, 108);
-        Gui.Theme.Separator = new Color(196, 196, 196, 112);
-        Gui.Theme.SelectableBg = Color.Transparent;
-        Gui.Theme.SelectableBgHover = new Color(72, 118, 188, 76);
-        Gui.Theme.SelectableBgPressed = new Color(72, 118, 188, 112);
-        Gui.Theme.SelectableBgSelected = new Color(72, 118, 188, 188);
-        Gui.Theme.SelectableBorder = Color.Transparent;
-        Gui.Theme.SelectableBorderHover = Color.Transparent;
-        Gui.Theme.SelectableBorderPressed = Color.Transparent;
-        Gui.Theme.SelectableBorderSelected = new Color(128, 170, 226, 136);
-        Gui.Theme.CollapsingHeaderBg = Color.Transparent;
-        Gui.Theme.CollapsingHeaderBgHover = new Color(72, 118, 188, 64);
-        Gui.Theme.CollapsingHeaderBgPressed = new Color(72, 118, 188, 96);
-        Gui.Theme.CollapsingHeaderBgOpen = Color.Transparent;
-        Gui.Theme.CollapsingHeaderPadding = new EdgeInsets(2f, 2f);
-        Gui.Theme.ScrollbarTrack = new Color(80, 80, 80, 150);
-        Gui.Theme.ScrollbarThumb = new Color(40, 40, 40, 150);
-        Gui.Theme.ScrollbarThumbHover = new Color(120, 166, 232, 150);
-        Gui.Theme.ScrollbarThumbActive = new Color(120, 166, 232, 208);
-        Gui.Theme.WindowTitleText = new Color(255, 200, 90);
-        Gui.Theme.TextPrimary = Color.White;
-        Gui.Theme.TextSecondary = new Color(228, 228, 228);
-        Gui.Theme.TreeIndent = 0f;
-        Gui.Theme.UseLcdText = true;
-        Gui.Theme.SliderBlockWidthFactor = 0.2f;
+        ConfigureGuiTheme();
     }
 
     public RigidBodyShape? FloorShape => floorShape;
@@ -270,6 +231,7 @@ public partial class Playground : RenderWindow
         if (!overlayFramePrepared)
             PrepareCustomOverlayFrame(logicalWidth, logicalHeight, framebufferWidth, framebufferHeight);
 
+        DrawWorldLabels(logicalWidth, logicalHeight);
         Gui.EndFrame();
         overlayFramePrepared = false;
         WantsCaptureKeyboard = Gui.WantsCaptureKeyboard;
@@ -298,8 +260,9 @@ public partial class Playground : RenderWindow
                     continue;
                 }
 
-                var color = ColorGenerator.GetColor(shape.GetHashCode());
-                if (!shape.RigidBody.Data.IsActive) color += new Vector3(0.2f, 0.2f, 0.2f);
+                Vector3? bodyColor = (body.Tag as RigidBodyTag)?.Color;
+                var color = bodyColor ?? ColorGenerator.GetColor(shape.GetHashCode());
+                if (!bodyColor.HasValue && !shape.RigidBody.Data.IsActive) color += new Vector3(0.2f, 0.2f, 0.2f);
 
                 if (shape is TransformedShape ts)
                 {
@@ -314,7 +277,7 @@ public partial class Playground : RenderWindow
             }
         }
 
-        (currentDemo as IDrawUpdate)?.DrawUpdate();
+        currentDemo?.DrawUpdate();
 
         DebugDraw();
 
@@ -325,10 +288,7 @@ public partial class Playground : RenderWindow
 
         if (!Mouse.IsButtonDown(Mouse.Button.Left))
         {
-            if (grabConstraint != null) world.Remove(grabConstraint);
-            grabBody = null;
-            grabConstraint = null;
-            grabbing = false;
+            ClearGrab();
         }
 
         if (Keyboard.KeyPressBegin(Keyboard.Key.M))

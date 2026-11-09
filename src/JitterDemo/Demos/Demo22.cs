@@ -8,7 +8,7 @@ using JitterDemo.Renderer;
 
 namespace JitterDemo;
 
-public class Demo22 : IDemo, ICleanDemo, IDrawUpdate
+public class Demo22 : IDemo
 {
     public string Name => "Conveyor Belt";
     public string Description => "Kinematic planks forming a conveyor belt that transports rigid bodies.";
@@ -80,10 +80,10 @@ public class Demo22 : IDemo, ICleanDemo, IDrawUpdate
         }
     }
 
-    public void Build(Playground pg, World world)
+    public void Build(Playground pg)
     {
         this.pg = pg;
-        this.world = world;
+        world = pg.World;
         pg.AddFloor();
         planks.Clear();
         physicsTime = 0;
@@ -110,8 +110,9 @@ public class Demo22 : IDemo, ICleanDemo, IDrawUpdate
             // Align initial orientation
             JVector fwd = JVector.Normalize(vel);
             JVector up = JVector.UnitY;
-            JVector right = JVector.Cross(fwd, up);
-            JMatrix ori = new JMatrix(right.X, up.X, fwd.X, right.Y, up.Y, fwd.Y, right.Z, up.Z, fwd.Z);
+            JVector right = JVector.Normalize(JVector.Cross(up, fwd));
+            up = JVector.Cross(fwd, right);
+            JMatrix ori = JMatrix.FromColumns(right, up, fwd);
             body.Orientation = JQuaternion.CreateFromMatrix(ori);
 
             planks.Add(new BeltPlank { Body = body, DistanceOffset = dist });
@@ -132,9 +133,9 @@ public class Demo22 : IDemo, ICleanDemo, IDrawUpdate
     }
 
     // Called automatically by Jitter before every physics sub-step
-    private void OnPreStep(float dt)
+    private void OnPreStep(TimeStep timeStep)
     {
-        physicsTime += dt;
+        physicsTime += timeStep.SubstepDt;
         float globalDist = (float)physicsTime * Curve.Speed;
 
         foreach (var plank in planks)

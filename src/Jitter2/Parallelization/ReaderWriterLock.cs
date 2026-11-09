@@ -4,82 +4,179 @@
  * SPDX-License-Identifier: MIT
  */
 
+using System;
+using System.Runtime.CompilerServices;
 using System.Threading;
+using Jitter2.Unmanaged;
 
 namespace Jitter2.Parallelization;
 
 /// <summary>
-/// Provides a lightweight reader-writer lock optimized for rare write operations.
+/// Allows concurrent readers or one exclusive writer.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Multiple readers can hold the lock concurrently, but writers have exclusive access.
-/// This implementation uses spin-waiting and is best suited for short critical sections.
+/// Waiting threads spin, so use this lock only for short operations with infrequent writes.
 /// </para>
 /// <para>
-/// Thread-safe. All methods use atomic operations and memory barriers.
+/// Release each acquired lock exactly once, on the thread that acquired it. Do not acquire
+/// the lock again while holding it or switch directly between a read lock and a write lock.
 /// </para>
 /// </remarks>
-public struct ReaderWriterLock
+public sealed class ReaderWriterLock
 {
-    private volatile int writer;
-    private volatile int reader;
+    private const int YieldThreshold = 32;
+    private const int SleepThreshold = 128;
+    private const int ReaderSlotCount = 128;
+
+    // Give each thread a stable reader slot. This allows readers to usually update
+    // separate counters instead of contending on one shared counter and causing
+    // cache-line bouncing.
+    [ThreadStatic]
+    private static int readerSlotPlusOne;
+
+    // Slot assignment is shared across lock instances so that a thread normally
+    // reuses the same slot for every ReaderWriterLock instance.
+    private static int nextReaderSlot;
+
+    private int writer;
+
+    // Reader counters are padded so counters in adjacent slots do not normally
+    // occupy the same cache line. Together with per-thread slot assignment, this
+    // reduces cache-line bouncing between concurrent readers.
+    private readonly MemoryHelper.PaddedInt[] readers =
+        new MemoryHelper.PaddedInt[ReaderSlotCount];
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Backoff(ref int count)
+    {
+        int current = count;
+        if (count < int.MaxValue) count++;
+
+        if (current < YieldThreshold)
+        {
+            Thread.SpinWait(1);
+        }
+        else if (current < SleepThreshold)
+        {
+            Thread.Yield();
+        }
+        else
+        {
+            Thread.Sleep(0);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int GetReaderSlot()
+    {
+        int slot = readerSlotPlusOne - 1;
+        if (slot >= 0) return slot;
+
+        // If the number of participating threads exceeds ReaderSlotCount, slots
+        // are shared. This increases contention but does not affect correctness.
+        slot = (int)((uint)(Interlocked.Increment(ref nextReaderSlot) - 1) %
+                     ReaderSlotCount);
+
+        readerSlotPlusOne = slot + 1;
+        return slot;
+    }
 
     /// <summary>
-    /// Acquires the read lock. Blocks while a writer holds the lock.
+    /// Acquires the read lock.
     /// </summary>
     /// <remarks>
-    /// Multiple threads can hold the read lock simultaneously.
-    /// Call <see cref="ExitReadLock"/> to release.
+    /// Multiple threads can hold the read lock simultaneously. This method blocks
+    /// while a writer holds the lock.
+    /// Release it with <see cref="ExitReadLock"/> on the same thread.
     /// </remarks>
     public void EnterReadLock()
     {
+        int slot = GetReaderSlot();
+        int backoff = 0;
+
         while (true)
         {
-            while (writer == 1) Thread.SpinWait(1);
+            while (Volatile.Read(ref writer) == 1)
+            {
+                Backoff(ref backoff);
+            }
 
-            Interlocked.Increment(ref reader);
-            if (writer == 0) break;
-            Interlocked.Decrement(ref reader);
+            Interlocked.Increment(ref readers[slot].Value);
+
+            if (Volatile.Read(ref writer) == 0)
+            {
+                break;
+            }
+
+            Interlocked.Decrement(ref readers[slot].Value);
+            Backoff(ref backoff);
         }
     }
 
     /// <summary>
-    /// Acquires the write lock with exclusive access. Blocks until all readers and writers release.
+    /// Acquires the write lock with exclusive access.
     /// </summary>
     /// <remarks>
-    /// Only one thread can hold the write lock at a time.
-    /// Call <see cref="ExitWriteLock"/> to release.
+    /// This method blocks until all readers and other writers have released the lock.
+    /// Release it with <see cref="ExitWriteLock"/> on the same thread.
     /// </remarks>
     public void EnterWriteLock()
     {
-        SpinWait sw = new();
+        int backoff = 0;
 
         while (true)
         {
             if (Interlocked.CompareExchange(ref writer, 1, 0) == 0)
             {
-                while (reader != 0) Thread.SpinWait(1);
+                while (HasReaders())
+                {
+                    Backoff(ref backoff);
+                }
+
                 break;
             }
 
-            sw.SpinOnce();
+            Backoff(ref backoff);
         }
     }
 
-    /// <summary>
-    /// Exits the read section.
-    /// </summary>
-    public void ExitReadLock()
+    private bool HasReaders()
     {
-        Interlocked.Decrement(ref reader);
+        for (int i = 0; i < readers.Length; i++)
+        {
+            if (Volatile.Read(ref readers[i].Value) != 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
-    /// Exits the write section.
+    /// Releases a read lock previously acquired by the current thread.
     /// </summary>
+    /// <remarks>
+    /// Must be called exactly once for each successful call to
+    /// <see cref="EnterReadLock"/> and on the same thread that acquired the lock.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void ExitReadLock()
+    {
+        Interlocked.Decrement(ref readers[GetReaderSlot()].Value);
+    }
+
+    /// <summary>
+    /// Releases the write lock held by the current thread.
+    /// </summary>
+    /// <remarks>
+    /// Must be called exactly once after a successful call to
+    /// <see cref="EnterWriteLock"/> and on the same thread that acquired the lock.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void ExitWriteLock()
     {
-        writer = 0;
+        Volatile.Write(ref writer, 0);
     }
 }

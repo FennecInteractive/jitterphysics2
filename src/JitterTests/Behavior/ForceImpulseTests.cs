@@ -65,7 +65,7 @@ public class ForceImpulseTests
         body.AddShape(new SphereShape(1));
         body.MotionType = MotionType.Static;
         body.ApplyImpulse(new JVector(1, 0, 0));
-        // Static bodies have InverseMass == 0; velocity stays zero
+        // Static bodies have zero InverseMassVector; velocity stays zero
         Assert.That(body.Velocity, Is.EqualTo(JVector.Zero));
         world.Dispose();
     }
@@ -138,6 +138,62 @@ public class ForceImpulseTests
         world.Step(1f / 60f, false);   // DeltaVelocity computed from Force
         world.Step(1f / 60f, false);   // DeltaVelocity applied to Velocity
         Assert.That(body.Velocity.X, Is.GreaterThan(0));
+        world.Dispose();
+    }
+
+    [TestCase]
+    public void MotionTypeChange_ClearsQueuedForceAndTorque()
+    {
+        var world = new World();
+        var body = world.CreateRigidBody();
+        body.AddShape(new SphereShape(1));
+
+        body.AddForce(new JVector(0, 10, 0), new JVector(1, 0, 0));
+
+        Assert.That(body.Force.LengthSquared(), Is.GreaterThan((Real)0.0));
+        Assert.That(body.Torque.LengthSquared(), Is.GreaterThan((Real)0.0));
+
+        body.MotionType = MotionType.Kinematic;
+
+        Assert.That(body.Force, Is.EqualTo(JVector.Zero));
+        Assert.That(body.Torque, Is.EqualTo(JVector.Zero));
+        Assert.That(body.Data.DeltaVelocity, Is.EqualTo(JVector.Zero));
+        Assert.That(body.Data.DeltaAngularVelocity, Is.EqualTo(JVector.Zero));
+
+        world.Dispose();
+    }
+
+    [TestCase]
+    public void MotionTypeChange_ClearsForceDerivedVelocityDelta()
+    {
+        var world = new World
+        {
+            AllowDeactivation = false,
+            Gravity = JVector.Zero
+        };
+
+        var body = world.CreateRigidBody();
+        body.AddShape(new SphereShape(1));
+        body.AddForce(new JVector(0, 100, 0), new JVector(1, 0, 0));
+
+        world.Step((Real)1.0 / (Real)60.0, false);
+
+        Assert.That(body.Velocity, Is.EqualTo(JVector.Zero));
+        Assert.That(body.AngularVelocity, Is.EqualTo(JVector.Zero));
+        Assert.That(body.Data.DeltaVelocity.LengthSquared(), Is.GreaterThan((Real)0.0));
+        Assert.That(body.Data.DeltaAngularVelocity.LengthSquared(), Is.GreaterThan((Real)0.0));
+
+        body.MotionType = MotionType.Kinematic;
+
+        Assert.That(body.Data.DeltaVelocity, Is.EqualTo(JVector.Zero));
+        Assert.That(body.Data.DeltaAngularVelocity, Is.EqualTo(JVector.Zero));
+
+        body.MotionType = MotionType.Dynamic;
+        world.Step((Real)1.0 / (Real)60.0, false);
+
+        Assert.That(body.Velocity, Is.EqualTo(JVector.Zero));
+        Assert.That(body.AngularVelocity, Is.EqualTo(JVector.Zero));
+
         world.Dispose();
     }
 

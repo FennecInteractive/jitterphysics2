@@ -16,7 +16,7 @@ namespace Jitter2.LinearMath;
 /// Uses the Hamilton convention where <c>i² = j² = k² = ijk = -1</c>.
 /// </summary>
 [StructLayout(LayoutKind.Explicit, Size = 4 * sizeof(Real))]
-public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<JQuaternion>
+public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<JQuaternion>, IFormattable
 {
     [FieldOffset(0 * sizeof(Real))] public Real X = x;
     [FieldOffset(1 * sizeof(Real))] public Real Y = y;
@@ -73,10 +73,8 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// the unit vector <paramref name="to"/>.
     /// </summary>
     /// <remarks>
-    /// This calculation relies on the half-angle formula.
-    /// If the vectors are parallel (<c>dot ≈ 1</c>), Identity is returned.
-    /// If the vectors are opposite (<c>dot ≈ -1</c>), a rotation of 180° (π radians)
-    /// around an arbitrary orthogonal axis is returned.
+    /// Nearly opposite directions produce a 180° rotation around an arbitrary axis
+    /// perpendicular to <paramref name="from"/>.
     /// </remarks>
     /// <param name="from">Source direction (must be unit length).</param>
     /// <param name="to">Target direction (must be unit length).</param>
@@ -156,9 +154,18 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// <summary>
     /// Returns a string representing the quaternion in the format <c>X=..., Y=..., Z=..., W=...</c>.
     /// </summary>
-    public readonly override string ToString()
+    public readonly override string ToString() => ToString(null, null);
+
+    /// <summary>Formats the components using the specified numeric format and the current culture.</summary>
+    public readonly string ToString(string? format) => ToString(format, null);
+
+    /// <summary>Formats the components using the specified numeric format and culture.</summary>
+    /// <param name="format">A numeric format string, or null or empty to use the general format.</param>
+    /// <param name="formatProvider">The format provider, or null to use the current culture.</param>
+    public readonly string ToString(string? format, IFormatProvider? formatProvider)
     {
-        return $"X={X:F6}, Y={Y:F6}, Z={Z:F6}, W={W:F6}";
+        return $"X={X.ToString(format, formatProvider)}, Y={Y.ToString(format, formatProvider)}, " +
+               $"Z={Z.ToString(format, formatProvider)}, W={W.ToString(format, formatProvider)}";
     }
 
     /// <summary>
@@ -193,7 +200,7 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// Multiplies two quaternions (Hamilton Product).
     /// </summary>
     /// <remarks>
-    /// Non-commutative. <c>Q1 * Q2</c> represents the rotation Q2 followed by Q1 (local frame) or Q1 followed by Q2 (global frame).
+    /// Non-commutative. <c>Q1 * Q2</c> applies Q2 first, then Q1.
     /// </remarks>
     /// <param name="quaternion1">The first quaternion.</param>
     /// <param name="quaternion2">The second quaternion.</param>
@@ -209,7 +216,7 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// Calculates the transformation of the X-axis <c>(1, 0, 0)</c> by this quaternion.
     /// </summary>
     /// <remarks>
-    /// Mathematically equivalent to <c>q · (1,0,0) · q⁻¹</c>.<br/>
+    /// For a unit quaternion, mathematically equivalent to <c>q · (1,0,0) · q⁻¹</c>.<br/>
     /// Result: <c>[1 - 2(y² + z²), 2(xy + zw), 2(xz - yw)]</c>
     /// </remarks>
     /// <returns>The transformed vector.</returns>
@@ -226,7 +233,7 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// Calculates the transformation of the Y-axis <c>(0, 1, 0)</c> by this quaternion.
     /// </summary>
     /// <remarks>
-    /// Mathematically equivalent to <c>q · (0,1,0) · q⁻¹</c>.<br/>
+    /// For a unit quaternion, mathematically equivalent to <c>q · (0,1,0) · q⁻¹</c>.<br/>
     /// Result: <c>[2(xy - zw), 1 - 2(x² + z²), 2(yz + xw)]</c>
     /// </remarks>
     /// <returns>The transformed vector.</returns>
@@ -243,7 +250,7 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// Calculates the transformation of the Z-axis <c>(0, 0, 1)</c> by this quaternion.
     /// </summary>
     /// <remarks>
-    /// Mathematically equivalent to <c>q · (0,0,1) · q⁻¹</c>.<br/>
+    /// For a unit quaternion, mathematically equivalent to <c>q · (0,0,1) · q⁻¹</c>.<br/>
     /// Result: <c>[2(xz + yw), 2(yz - xw), 1 - 2(x² + y²)]</c>
     /// </remarks>
     /// <returns>The transformed vector.</returns>
@@ -320,27 +327,21 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// <param name="angle">Output: The rotation angle (radians).</param>
     public static void ToAxisAngle(JQuaternion quaternion, out JVector axis, out Real angle)
     {
-        Real s = MathR.Sqrt(MathR.Max((Real)0.0, (Real)1.0 - quaternion.W * quaternion.W));
+        // q and -q are the same rotation; W >= 0 selects the shortest arc (angle between 0 and PI).
+        if (quaternion.W < (Real)0.0) quaternion *= -1;
 
-        const Real epsilonSingularity = (Real)1e-6;
+        // Taking the sine from the vector part keeps small angles accurate, where 1 - W * W cancels.
+        Real s = quaternion.Vector.Length();
 
-        if (s < epsilonSingularity)
+        if (!(s > (Real)0.0))
         {
             angle = (Real)0.0;
             axis = JVector.UnitX;
             return;
         }
 
-        Real invS = (Real)1.0 / s;
-        axis = new JVector(quaternion.X * invS, quaternion.Y * invS, quaternion.Z * invS);
-        angle = (Real)2.0 * StableMath.Acos(quaternion.W);
-
-        // Enforce the shortest-arc representation (angle between 0 and PI)
-        if (angle > MathR.PI)
-        {
-            angle = (Real)2.0 * MathR.PI - angle;
-            axis = -axis;
-        }
+        axis = quaternion.Vector * ((Real)1.0 / s);
+        angle = (Real)2.0 * StableMath.Atan2(s, quaternion.W);
     }
 
     /// <summary>
@@ -469,7 +470,7 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public readonly Real Length()
     {
-        return (Real)Math.Sqrt(X * X + Y * Y + Z * Z + W * W);
+        return MathR.Sqrt(X * X + Y * Y + Z * Z + W * W);
     }
 
     /// <summary>
@@ -486,16 +487,16 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// Normalizes the quaternion to unit length.
     /// </summary>
     [Obsolete($"In-place Normalize() is deprecated; " +
-              $"use the static {nameof(JQuaternion.Normalize)} method or {nameof(JQuaternion.NormalizeInPlace)}.")]
+              $"use the static {nameof(JQuaternion.Normalize)} method or {nameof(JQuaternion.NormalizeInPlace)}.", true)]
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Normalize()
     {
-        Real num2 = X * X + Y * Y + Z * Z + W * W;
-        Real num = (Real)1.0 / MathR.Sqrt(num2);
-        X *= num;
-        Y *= num;
-        Z *= num;
-        W *= num;
+        Real lengthSquared = X * X + Y * Y + Z * Z + W * W;
+        Real invLength = (Real)1.0 / MathR.Sqrt(lengthSquared);
+        X *= invLength;
+        Y *= invLength;
+        Z *= invLength;
+        W *= invLength;
     }
 
     /// <summary>
@@ -504,12 +505,12 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// <param name="quaternion">The quaternion to normalize.</param>
     public static void NormalizeInPlace(ref JQuaternion quaternion)
     {
-        Real num2 = quaternion.LengthSquared();
-        Real num = (Real)1.0 / MathR.Sqrt(num2);
-        quaternion.X *= num;
-        quaternion.Y *= num;
-        quaternion.Z *= num;
-        quaternion.W *= num;
+        Real lengthSquared = quaternion.LengthSquared();
+        Real invLength = (Real)1.0 / MathR.Sqrt(lengthSquared);
+        quaternion.X *= invLength;
+        quaternion.Y *= invLength;
+        quaternion.Z *= invLength;
+        quaternion.W *= invLength;
     }
 
     /// <summary>
@@ -584,7 +585,7 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
             }
         }
 
-        t = (Real)(0.5d / Math.Sqrt(t));
+        t = (Real)0.5 / MathR.Sqrt(t);
         result.X *= t;
         result.Y *= t;
         result.Z *= t;
@@ -611,7 +612,8 @@ public partial struct JQuaternion(Real x, Real y, Real z, Real w) : IEquatable<J
     /// </summary>
     /// <remarks>
     /// Unlike <see cref="Conjugate(in JQuaternion)"/>, this handles non-unit quaternions correctly
-    /// by dividing by the squared length.
+    /// by dividing by the squared length. Returns <see cref="Identity"/> when the squared length
+    /// is below 1e-12.
     /// </remarks>
     public static JQuaternion Inverse(in JQuaternion value)
     {

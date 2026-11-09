@@ -13,13 +13,20 @@ using Jitter2.LinearMath;
 namespace Jitter2.Collision.Shapes;
 
 /// <summary>
-/// Implements a SIMD accelerated support map for a set of vertices.
+/// Describes the convex hull of a set of vertices through its support points.
 /// </summary>
-public struct VertexSupportMap : ISupportMappable, IEquatable<VertexSupportMap>
+public struct VertexSupportMap : ISupportFeature, IEquatable<VertexSupportMap>
 {
     private readonly Real[] xvalues, yvalues, zvalues;
     private JVector center;
 
+    /// <summary>
+    /// Initializes a new support map from a set of vertices.
+    /// </summary>
+    /// <param name="vertices">The vertices defining the convex hull.</param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="vertices"/> is empty.
+    /// </exception>
     public VertexSupportMap(ReadOnlySpan<JVector> vertices)
     {
         if (vertices.Length == 0)
@@ -47,8 +54,9 @@ public struct VertexSupportMap : ISupportMappable, IEquatable<VertexSupportMap>
         center *= (Real)1.0 / length;
     }
 
+    /// <inheritdoc cref="VertexSupportMap(ReadOnlySpan{JVector})"/>
     public VertexSupportMap(IEnumerable<JVector> vertices) :
-        this(SpanHelper.AsReadOnlySpan(vertices, out _))
+        this(SpanHelper.AsReadOnlySpan(vertices))
     {
 
     }
@@ -139,6 +147,10 @@ public struct VertexSupportMap : ISupportMappable, IEquatable<VertexSupportMap>
     }
 
     public readonly void GetCenter(out JVector point) => point = center;
+
+    /// <inheritdoc/>
+    public readonly int SupportFeature(in JVector direction, Real tolerance, Span<JVector> vertices) =>
+        SupportFeatureSampler.Sample(this, direction, tolerance, vertices);
 
     public readonly bool Equals(VertexSupportMap other) => xvalues.Equals(other.xvalues) &&
                                                   yvalues.Equals(other.yvalues) &&

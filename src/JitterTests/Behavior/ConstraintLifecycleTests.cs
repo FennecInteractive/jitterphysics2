@@ -20,6 +20,27 @@ public class ConstraintLifecycleTests
         world.Dispose();
     }
 
+    [Test]
+    public void CreateConstraint_WithRemovedBody_ThrowsAndLeavesTheWorldIntact([Values] bool removedFirst)
+    {
+        using var world = new World();
+        var removed = world.CreateRigidBody();
+        var other = world.CreateRigidBody();
+        world.Remove(removed);
+
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            if (removedFirst) world.CreateConstraint<BallSocket>(removed, other);
+            else world.CreateConstraint<BallSocket>(other, removed);
+        });
+
+        Assert.That(other.Constraints, Is.Empty);
+        Assert.That(other.Connections, Is.Empty);
+        Assert.That(world.RawData.Constraints.Length, Is.Zero);
+        Assert.That(world.RawData.SmallConstraints.Length, Is.Zero);
+        Assert.DoesNotThrow(() => world.Step((Real)(1.0 / 60.0), false));
+    }
+
     [TestCase]
     public void RemoveConstraint_UnregistersFromBothBodies_AndRemovesConnection()
     {
@@ -28,8 +49,11 @@ public class ConstraintLifecycleTests
         var bodyB = world.CreateRigidBody();
 
         var constraint = world.CreateConstraint<BallSocket>(bodyA, bodyB);
+
+        Assert.That(constraint.IsValid, Is.True);
         world.Remove(constraint);
 
+        Assert.That(constraint.IsValid, Is.False);
         Assert.That(bodyA.Constraints, Does.Not.Contain(constraint));
         Assert.That(bodyB.Constraints, Does.Not.Contain(constraint));
         Assert.That(bodyA.Connections, Does.Not.Contain(bodyB));
@@ -45,11 +69,92 @@ public class ConstraintLifecycleTests
         var bodyB = world.CreateRigidBody();
 
         var constraint = world.CreateConstraint<BallSocket>(bodyA, bodyB);
+
+        Assert.That(bodyA.IsValid, Is.True);
+        Assert.That(bodyB.IsValid, Is.True);
+        Assert.That(constraint.IsValid, Is.True);
+
         world.Remove(bodyA);
 
+        Assert.That(bodyA.IsValid, Is.False);
+        Assert.That(bodyB.IsValid, Is.True);
+        Assert.That(constraint.IsValid, Is.False);
         Assert.That(bodyB.Constraints, Does.Not.Contain(constraint));
         Assert.That(bodyB.Connections, Does.Not.Contain(bodyA));
         world.Dispose();
+    }
+
+    [TestCase]
+    public void ConstraintRemoved_IsRaisedForExplicitRemoval()
+    {
+        using var world = new World();
+        var bodyA = world.CreateRigidBody();
+        var bodyB = world.CreateRigidBody();
+        var constraint = world.CreateConstraint<BallSocket>(bodyA, bodyB);
+        Constraint? received = null;
+
+        world.ConstraintRemoved += removedConstraint =>
+        {
+            Assert.That(removedConstraint.IsValid, Is.False);
+            received = removedConstraint;
+        };
+
+        world.Remove(constraint);
+
+        Assert.That(received, Is.SameAs(constraint));
+    }
+
+    [TestCase]
+    public void ConstraintRemoved_IsRaisedForBodyRemoval()
+    {
+        using var world = new World();
+        var bodyA = world.CreateRigidBody();
+        var bodyB = world.CreateRigidBody();
+        var constraint = world.CreateConstraint<BallSocket>(bodyA, bodyB);
+        Constraint? received = null;
+        world.ConstraintRemoved += removedConstraint => received = removedConstraint;
+
+        world.Remove(bodyA);
+
+        Assert.That(received, Is.SameAs(constraint));
+    }
+
+    [TestCase(MotionType.Static)]
+    [TestCase(MotionType.Kinematic)]
+    public void ConstraintRemoved_IsNotRaisedForMotionTypeChange(MotionType motionType)
+    {
+        using var world = new World();
+        var bodyA = world.CreateRigidBody();
+        var bodyB = world.CreateRigidBody();
+        var constraint = world.CreateConstraint<BallSocket>(bodyA, bodyB);
+        Constraint? received = null;
+        world.ConstraintRemoved += removedConstraint => received = removedConstraint;
+
+        bodyA.MotionType = motionType;
+
+        Assert.That(received, Is.Null);
+        Assert.That(constraint.IsValid, Is.True);
+
+        bodyB.MotionType = motionType;
+
+        Assert.That(received, Is.Null);
+        Assert.That(constraint.IsValid, Is.True);
+    }
+
+    [TestCase]
+    public void ConstraintRemoved_IsNotRaisedForDisableOrDispose()
+    {
+        var world = new World();
+        var bodyA = world.CreateRigidBody();
+        var bodyB = world.CreateRigidBody();
+        var constraint = world.CreateConstraint<BallSocket>(bodyA, bodyB);
+        var eventCount = 0;
+        world.ConstraintRemoved += _ => eventCount++;
+
+        constraint.IsEnabled = false;
+        world.Dispose();
+
+        Assert.That(eventCount, Is.Zero);
     }
 
     [TestCase]
@@ -58,7 +163,9 @@ public class ConstraintLifecycleTests
         var world = new World();
         var body = world.CreateRigidBody();
 
-        Assert.Throws<ArgumentException>(() => world.CreateConstraint<BallSocket>(body, body));
+        var exception = Assert.Throws<SameBodyException>(() =>
+            world.CreateConstraint<BallSocket>(body, body));
+        Assert.That(exception!.ParamName, Is.EqualTo("body2"));
         world.Dispose();
     }
 

@@ -83,12 +83,14 @@ public readonly struct ReadOnlyPartitionedSet<T>(PartitionedSet<T> partitionedSe
 /// <typeparam name="T">The type of elements in the set, which must implement <see cref="IPartitionedSetIndex"/>.</typeparam>
 /// <remarks>
 /// The methods <see cref="Add(T, bool)"/>, <see cref="Remove(T)"/>, <see cref="Contains(T)"/>, <see cref="IsActive(T)"/>,
-/// <see cref="MoveToActive(T)"/>, and <see cref="MoveToInactive(T)"/> all operate in O(1) time complexity.
+/// <see cref="MoveToActive(T)"/>, and <see cref="MoveToInactive(T)"/> operate in O(1) time,
+/// except that <see cref="Add(T, bool)"/> can take O(n) time when the backing array grows.
 /// </remarks>
 public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSetIndex
 {
     public struct Enumerator(PartitionedSet<T> partitionedSet) : IEnumerator<T>
     {
+        private readonly int version = partitionedSet.version;
         private int index = -1;
 
         public readonly T Current => (index >= 0 ? partitionedSet[index] : null)!;
@@ -101,6 +103,8 @@ public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSet
 
         public bool MoveNext()
         {
+            ThrowIfModified();
+
             if (index < partitionedSet.Count - 1)
             {
                 index++;
@@ -112,11 +116,20 @@ public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSet
 
         public void Reset()
         {
+            ThrowIfModified();
             index = -1;
+        }
+
+        private readonly void ThrowIfModified()
+        {
+            if (version != partitionedSet.version)
+                throw new InvalidOperationException("The set was modified during enumeration. Enumerate a copy to change it while looping.");
         }
     }
 
+    private readonly int initialSize;
     private T[] elements;
+    private int version;
 
     /// <summary>Gets the number of active elements in the set.</summary>
     public int ActiveCount { get; private set; }
@@ -127,8 +140,14 @@ public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSet
     /// <param name="initialSize">The initial capacity of the internal array.</param>
     public PartitionedSet(int initialSize = 1024)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(initialSize, 1);
+
+        this.initialSize = initialSize;
         elements = new T[initialSize];
     }
+
+    /// <summary>Gets the number of elements the set can hold before the next resize.</summary>
+    public int Capacity => elements.Length;
 
     /// <summary>Gets the element at the specified index.</summary>
     public T this[int i] => elements[i];
@@ -153,10 +172,30 @@ public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSet
 
         Count = 0;
         ActiveCount = 0;
+        version++;
     }
 
     /// <summary>Gets the total number of elements in the set.</summary>
     public int Count { get; private set; }
+
+    /// <summary>
+    /// Shrinks the internal storage to the smallest retained capacity that can hold the current elements.
+    /// </summary>
+    /// <returns><see langword="true"/> if the set was resized; otherwise, <see langword="false"/>.</returns>
+    public bool Trim()
+    {
+        int newSize = initialSize;
+
+        while (newSize < Count)
+        {
+            newSize = checked(newSize * 2);
+        }
+
+        if (newSize >= elements.Length) return false;
+
+        Array.Resize(ref elements, newSize);
+        return true;
+    }
 
     /// <summary>Returns a span of all elements in the set.</summary>
     public Span<T> AsSpan() => this.elements.AsSpan(0, Count);
@@ -177,6 +216,7 @@ public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSet
 
         element.SetIndex = Count;
         elements[Count++] = element;
+        version++;
 
         if (active) MoveToActive(element);
     }
@@ -214,9 +254,11 @@ public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSet
         Debug.Assert(element.SetIndex != -1);
         Debug.Assert(elements[element.SetIndex] == element);
 
-        if (element.SetIndex < ActiveCount) return false;
-        Swap(ActiveCount, element.SetIndex);
+        int index = element.SetIndex;
+        if (index < ActiveCount) return false;
+        if (index != ActiveCount) Swap(ActiveCount, index);
         ActiveCount += 1;
+        version++;
         return true;
     }
 
@@ -230,9 +272,11 @@ public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSet
         Debug.Assert(element.SetIndex != -1);
         Debug.Assert(elements[element.SetIndex] == element);
 
-        if (element.SetIndex >= ActiveCount) return false;
+        int index = element.SetIndex;
+        if (index >= ActiveCount) return false;
         ActiveCount -= 1;
-        Swap(ActiveCount, element.SetIndex);
+        if (index != ActiveCount) Swap(ActiveCount, index);
+        version++;
         return true;
     }
 
@@ -243,7 +287,7 @@ public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSet
     /// <returns><see langword="true"/> if the element is found; otherwise, <see langword="false"/>.</returns>
     public bool Contains(T element)
     {
-        if(element.SetIndex >= Count || element.SetIndex < 0) return false;
+        if (element.SetIndex >= Count || element.SetIndex < 0) return false;
         return (elements[element.SetIndex] == element);
     }
 
@@ -258,15 +302,22 @@ public class PartitionedSet<T> : IEnumerable<T> where T : class, IPartitionedSet
 
         MoveToInactive(element);
 
-        int li = element.SetIndex;
+        int index = element.SetIndex;
+        int lastIndex = Count - 1;
 
-        Count -= 1;
+        Count = lastIndex;
 
-        elements[li] = elements[Count];
-        elements[li].SetIndex = li;
-        elements[Count] = null!;
+        if (index != lastIndex)
+        {
+            T moved = elements[lastIndex];
+            elements[index] = moved;
+            moved.SetIndex = index;
+        }
+
+        elements[lastIndex] = null!;
 
         element.SetIndex = -1;
+        version++;
     }
 
     public Enumerator GetEnumerator()

@@ -17,6 +17,12 @@ public class CapsuleShape : RigidBodyShape
     private Real radius;
     private Real halfLength;
 
+    /// <inheritdoc/>
+    protected internal override void DebugDrawLocal<TSink>(ref TSink triangleSink, in DebugDrawSettings settings)
+    {
+        ShapeDebugDraw.Capsule(ref triangleSink, radius, halfLength, settings.Segments);
+    }
+
     /// <summary>
     /// Gets or sets the radius of the capsule.
     /// </summary>
@@ -28,8 +34,7 @@ public class CapsuleShape : RigidBodyShape
         get => radius;
         set
         {
-            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, nameof(Radius));
-            radius = value;
+            radius = ArgumentCheck.Positive(value, nameof(Radius));
             UpdateWorldBoundingBox();
         }
     }
@@ -45,14 +50,13 @@ public class CapsuleShape : RigidBodyShape
         get => (Real)2.0 * halfLength;
         set
         {
-            ArgumentOutOfRangeException.ThrowIfNegative(value, nameof(Length));
-            halfLength = value / (Real)2.0;
+            halfLength = ArgumentCheck.NonNegative(value, nameof(Length)) / (Real)2.0;
             UpdateWorldBoundingBox();
         }
     }
 
     /// <summary>
-    /// Initializes a new instance of the CapsuleShape class with the specified radius and length. The symmetry axis of the capsule is aligned along the Y-axis.
+    /// Creates a capsule with its symmetry axis along the local Y-axis.
     /// </summary>
     /// <param name="radius">The radius of the capsule.</param>
     /// <param name="length">The length of the cylindrical part of the capsule, excluding the half-spheres at both ends.</param>
@@ -61,11 +65,8 @@ public class CapsuleShape : RigidBodyShape
     /// </exception>
     public CapsuleShape(Real radius = (Real)0.5, Real length = (Real)1.0)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(radius);
-        ArgumentOutOfRangeException.ThrowIfNegative(length);
-
-        this.radius = radius;
-        halfLength = (Real)0.5 * length;
+        this.radius = ArgumentCheck.Positive(radius, nameof(radius));
+        halfLength = (Real)0.5 * ArgumentCheck.NonNegative(length, nameof(length));
         UpdateWorldBoundingBox();
     }
 
@@ -84,6 +85,26 @@ public class CapsuleShape : RigidBodyShape
         // we have to calculate the dot-product with the direction
         // vector to decide whether p_1 or p_2 is the correct support point
         result.Y += MathR.Sign(direction.Y) * halfLength;
+    }
+
+    /// <inheritdoc/>
+    public override int SupportFeature(in JVector direction, Real tolerance, Span<JVector> vertices)
+    {
+        // Almost perpendicular to the axis, the capsule rests on the line of its cylindrical part
+        // that faces the direction. Otherwise it touches at a single point of one of its caps.
+        Real sideSq = direction.X * direction.X + direction.Z * direction.Z;
+
+        if (halfLength > (Real)0.0 && sideSq > (Real)0.0 &&
+            direction.Y * direction.Y < tolerance * tolerance * direction.LengthSquared())
+        {
+            Real scale = radius / MathR.Sqrt(sideSq);
+            vertices[0] = new JVector(direction.X * scale, halfLength, direction.Z * scale);
+            vertices[1] = new JVector(direction.X * scale, -halfLength, direction.Z * scale);
+            return 2;
+        }
+
+        SupportMap(direction, out vertices[0]);
+        return 1;
     }
 
     /// <inheritdoc/>
@@ -108,14 +129,14 @@ public class CapsuleShape : RigidBodyShape
     }
 
     /// <inheritdoc/>
-    public override void CalculateMassInertia(out JMatrix inertia, out JVector com, out Real mass)
+    public override void CalculateMassInertia(out JSymmetricMatrix inertia, out JVector com, out Real mass)
     {
         Real length = (Real)2.0 * halfLength;
 
         Real massSphere = (Real)(4.0 / 3.0) * MathR.PI * radius * radius * radius;
         Real massCylinder = MathR.PI * radius * radius * length;
 
-        inertia = JMatrix.Identity;
+        inertia = JSymmetricMatrix.Identity;
 
         inertia.M11 = massCylinder * ((Real)(1.0 / 12.0) * length * length + (Real)(1.0 / 4.0) * radius * radius) + massSphere *
             ((Real)(2.0 / 5.0) * radius * radius + (Real)(1.0 / 4.0) * length * length + (Real)(3.0 / 8.0) * length * radius);

@@ -5,7 +5,6 @@
  */
 
 using System;
-using System.Collections.Generic;
 using Jitter2.Unmanaged;
 
 namespace Jitter2.Dynamics;
@@ -15,24 +14,24 @@ namespace Jitter2.Dynamics;
 /// </summary>
 /// <remarks>
 /// <para>
-/// An arbiter is created when two shapes begin overlapping and is removed when they separate
-/// or when one of the involved bodies is removed from the world. Each arbiter can hold up to
-/// four cached contact points (see <see cref="ContactData"/>).
+/// Holds up to four contact points for a pair of shapes. CCD may create contacts before the
+/// shapes overlap. The arbiter is removed when contact ends or either body is removed.
 /// </para>
 /// <para>
-/// In most cases arbiters are keyed by shape identifiers. For arbiters created by the engine, the ordering
-/// is canonical: the shape with the smaller ID is always first.
+/// For contacts created by the engine, the shape with the smaller ID is first.
 /// </para>
 /// <para>
 /// The <see cref="Handle"/> property provides access to the underlying <see cref="ContactData"/>
 /// stored in unmanaged memory. This data is only valid while the arbiter exists and must not
 /// be accessed concurrently with <see cref="World.Step(Real, bool)"/>.
 /// </para>
+/// <para>
+/// Removed arbiters are recycled by their owning world. Do not retain an arbiter after
+/// removal: the same instance may subsequently represent a different pair of bodies.
+/// </para>
 /// </remarks>
 public sealed class Arbiter
 {
-    internal static readonly Stack<Arbiter> Pool = new();
-
     /// <summary>
     /// Gets the first rigid body involved in this contact.
     /// </summary>
@@ -48,7 +47,8 @@ public sealed class Arbiter
     /// </summary>
     /// <remarks>
     /// The underlying data is valid only while this arbiter is registered with the world.
-    /// After removal, accessing <see cref="JHandle{T}.Data"/> results in undefined behavior.
+    /// After removal, the arbiter object may be recycled for a different contact pair; do not retain
+    /// or access the handle after the arbiter's collision lifetime ends.
     /// </remarks>
     public JHandle<ContactData> Handle { get; internal set; }
 }

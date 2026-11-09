@@ -38,8 +38,7 @@ public static class MathHelper
     }
 
     /// <summary>
-    /// Calculates the rotation quaternion corresponding to the given angular velocity using
-    /// deterministic trigonometric approximations.
+    /// Calculates the rotation produced by a constant angular velocity over a time interval.
     /// </summary>
     /// <param name="omega">The angular velocity vector in radians per second.</param>
     /// <param name="dt">The time step in seconds.</param>
@@ -51,34 +50,34 @@ public static class MathHelper
 
         if (theta < (Real)1e-3)
         {
-            Real dt3 = dt * dt * dt;
-            Real angle2 = angle * angle;
+            // Exact rotation: (omega * sin(theta/2) / |omega|, cos(theta/2)).
+            // For small theta, the vector scale is dt/2 * (1 - theta^2/24)
+            // and the scalar part is 1 - theta^2/8 (Taylor expansions).
+            // Using theta^2 avoids forming dt^3, which can overflow in a long sweep.
+            Real theta2 = theta * theta;
+            Real smallAngleScale = (Real)0.5 * dt * ((Real)1.0 - theta2 / (Real)24.0);
+            JVector.Multiply(omega, smallAngleScale, out var smallAngleAxis);
 
-            Real scale = (Real)0.5 * dt - ((Real)1.0 / (Real)48.0) * dt3 * angle2;
-            JVector.Multiply(omega, scale, out var axis);
+            Real cos = (Real)1.0 - ((Real)1.0 / (Real)8.0) * theta2;
 
-            Real cos = (Real)1.0 - ((Real)1.0 / (Real)8.0) * theta * theta;
-
-            JQuaternion res = new JQuaternion(axis.X, axis.Y, axis.Z, cos);
-            Debug.Assert(MathHelper.IsZero(res.Length() - 1, (Real)1e-2));
-            return res;
+            JQuaternion smallAngleResult = new JQuaternion(smallAngleAxis.X, smallAngleAxis.Y, smallAngleAxis.Z, cos);
+            Debug.Assert(MathHelper.IsZero(smallAngleResult.Length() - 1, (Real)1e-2));
+            return smallAngleResult;
         }
-        else
-        {
-            Real halfAngleDt = (Real)0.5 * angle * dt;
-            (Real sinD, Real cosD) = StableMath.SinCos(halfAngleDt);
 
-            Real scale = sinD / angle;
-            JVector.Multiply(omega, scale, out var axis);
+        Real halfAngleDt = (Real)0.5 * angle * dt;
+        (Real sinD, Real cosD) = StableMath.SinCos(halfAngleDt);
 
-            JQuaternion res = new JQuaternion(axis.X, axis.Y, axis.Z, cosD);
-            Debug.Assert(MathHelper.IsZero(res.Length() - 1, (Real)1e-2));
-            return res;
-        }
+        Real scale = sinD / angle;
+        JVector.Multiply(omega, scale, out var axis);
+
+        JQuaternion result = new JQuaternion(axis.X, axis.Y, axis.Z, cosD);
+        Debug.Assert(MathHelper.IsZero(result.Length() - 1, (Real)1e-2));
+        return result;
     }
 
     /// <summary>
-    /// Checks if matrix is a pure rotation matrix.
+    /// Checks whether a matrix represents a rotation without scaling or reflection.
     /// </summary>
     /// <param name="matrix">The matrix to check.</param>
     /// <param name="epsilon">The tolerance for floating-point comparisons.</param>
@@ -100,7 +99,8 @@ public static class MathHelper
     /// </summary>
     /// <param name="vector">The vector to check.</param>
     /// <param name="epsilon">The tolerance for each component.</param>
-    /// <returns><see langword="true"/> if all components are within epsilon of zero; otherwise, <see langword="false"/>.</returns>
+    /// <returns><see langword="true"/> if no component has an absolute value greater than or equal to epsilon;
+    /// NaN components also satisfy this test.</returns>
     public static bool IsZero(in JVector vector, Real epsilon = (Real)1e-6)
     {
         return !(MathR.Abs(vector.X) >= epsilon) &&
@@ -124,7 +124,8 @@ public static class MathHelper
     /// </summary>
     /// <param name="matrix">The matrix to check.</param>
     /// <param name="epsilon">The tolerance for each element.</param>
-    /// <returns><see langword="true"/> if all elements are within epsilon of zero; otherwise, <see langword="false"/>.</returns>
+    /// <returns><see langword="true"/> if all rows satisfy <see cref="IsZero(in JVector, Real)"/>,
+    /// including rows with NaN components.</returns>
     public static bool UnsafeIsZero(ref JMatrix matrix, Real epsilon = (Real)1e-6)
     {
         if (!IsZero(matrix.UnsafeGet(0), epsilon)) return false;
@@ -134,11 +135,11 @@ public static class MathHelper
     }
 
     /// <summary>
-    /// Calculates <c>(MᵀM)^(-1/2)</c> using Jacobi iterations.
+    /// Approximates <c>M^(-1/2)</c> for a symmetric positive-definite matrix using Jacobi iterations.
     /// </summary>
-    /// <param name="m">The input matrix.</param>
+    /// <param name="m">The symmetric positive-definite input matrix.</param>
     /// <param name="sweeps">The number of Jacobi iterations.</param>
-    /// <returns>The inverse square root of <c>MᵀM</c>.</returns>
+    /// <returns>The approximate inverse square root of <c>M</c>.</returns>
     public static JMatrix InverseSquareRoot(JMatrix m, int sweeps = 2)
     {
         Unsafe.SkipInit(out JMatrix r);
@@ -149,7 +150,7 @@ public static class MathHelper
         {
             Real phi, cp, sp;
 
-            // M32
+            // M23
             if (MathR.Abs(m.M23) > (Real)1e-6)
             {
                 phi = StableMath.Atan2((Real)1.0, (m.M33 - m.M22) / ((Real)2.0 * m.M23)) / (Real)2.0;
@@ -191,10 +192,10 @@ public static class MathHelper
     }
 
     /// <summary>
-    /// Calculates an orthonormal vector to the given vector.
+    /// Returns a unit vector perpendicular to the given vector.
     /// </summary>
     /// <remarks>
-    /// The input vector must be non-zero. Debug builds assert this condition.
+    /// The input vector must be nonzero.
     /// </remarks>
     /// <param name="vec">The input vector (must be non-zero, does not need to be normalized).</param>
     /// <returns>A unit vector orthogonal to the input.</returns>
@@ -203,9 +204,9 @@ public static class MathHelper
     {
         Debug.Assert(!CloseToZero(vec), "Cannot create orthonormal of a zero vector");
 
-        Real ax = Math.Abs(vec.X);
-        Real ay = Math.Abs(vec.Y);
-        Real az = Math.Abs(vec.Z);
+        Real ax = MathR.Abs(vec.X);
+        Real ay = MathR.Abs(vec.Y);
+        Real az = MathR.Abs(vec.Z);
 
         JVector r;
 
@@ -252,7 +253,7 @@ public static class MathHelper
     }
 
     /// <summary>
-    /// Verifies whether the columns of the given matrix constitute an orthonormal basis.
+    /// Checks whether the matrix columns are mutually perpendicular unit vectors.
     /// </summary>
     /// <param name="matrix">The input matrix to check.</param>
     /// <param name="epsilon">The tolerance for floating-point comparisons.</param>
@@ -261,6 +262,147 @@ public static class MathHelper
     {
         JMatrix delta = JMatrix.MultiplyTransposed(matrix, matrix) - JMatrix.Identity;
         return UnsafeIsZero(ref delta, epsilon);
+    }
+
+    /// <summary>
+    /// Computes an approximate Moore-Penrose pseudoinverse of a symmetric,
+    /// positive-semidefinite 3x3 matrix.
+    /// </summary>
+    /// <param name="matrix">A finite, symmetric, positive-semidefinite matrix.</param>
+    /// <returns>The approximate inverse, with singular directions left at zero.</returns>
+    /// <remarks>
+    /// Uses a relative tolerance of 1e-6 in both precisions to identify nearly singular
+    /// matrices and discard small eigenvalues. The tolerance is
+    /// relative to the largest absolute diagonal entry. A zero matrix returns a zero matrix.
+    /// The input must be symmetric and positive semidefinite; these conditions are not checked.
+    /// </remarks>
+    public static JMatrix PseudoInverseSymmetric(in JMatrix matrix)
+    {
+        Real scale = MathR.Max(MathR.Abs(matrix.M11),
+            MathR.Max(MathR.Abs(matrix.M22), MathR.Abs(matrix.M33)));
+        if (!(scale > 0) || !Real.IsFinite(scale)) return JMatrix.Zero;
+
+        JSymmetricMatrix normalized = new(matrix.M11 / scale, matrix.M12 / scale, matrix.M13 / scale,
+            matrix.M22 / scale, matrix.M23 / scale, matrix.M33 / scale);
+        const Real tolerance = (Real)1e-6;
+        // Off-diagonal entries below this count as converged. It is far below single-precision
+        // roundoff, so single precision runs all sweeps, and double precision keeps its accuracy.
+        const Real rotationTolerance = (Real)1e-12;
+        if (MathR.Abs(normalized.Determinant()) > tolerance && JMatrix.Inverse(matrix, out JMatrix inverse))
+        {
+            return inverse;
+        }
+
+        Span<Real> a = stackalloc Real[9]
+        {
+            normalized.M11, normalized.M12, normalized.M13,
+            normalized.M12, normalized.M22, normalized.M23,
+            normalized.M13, normalized.M23, normalized.M33
+        };
+        Span<Real> basis = stackalloc Real[9] { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+
+        // Jacobi rotations diagonalize the symmetric matrix without trigonometric functions.
+        for (int sweep = 0; sweep < 8; sweep++)
+        {
+            bool changed = JacobiRotate(a, basis, 0, 1, rotationTolerance);
+            changed |= JacobiRotate(a, basis, 0, 2, rotationTolerance);
+            changed |= JacobiRotate(a, basis, 1, 2, rotationTolerance);
+            if (!changed) break;
+        }
+
+        JSymmetricMatrix result = JSymmetricMatrix.Zero;
+        for (int i = 0; i < 3; i++)
+        {
+            Real eigenvalue = a[3 * i + i];
+            if (!(eigenvalue > tolerance)) continue;
+            Real weight = ((Real)1.0 / eigenvalue) / scale;
+            JVector axis = new(basis[i], basis[3 + i], basis[6 + i]);
+            result += weight * new JSymmetricMatrix(axis.X * axis.X, axis.X * axis.Y, axis.X * axis.Z,
+                axis.Y * axis.Y, axis.Y * axis.Z, axis.Z * axis.Z);
+        }
+
+        return result.ToMatrix();
+    }
+
+    /// <summary>Inverts a constraint response block, retaining independent rows at different scales.</summary>
+    internal static JMatrix InverseSymmetric(in JMatrix matrix)
+    {
+        const Real tolerance = (Real)1e-6;
+        Real diagonalProduct = matrix.M11 * matrix.M22 * matrix.M33;
+        if (matrix.Determinant() / diagonalProduct > tolerance &&
+            JMatrix.Inverse(matrix, out JMatrix inverse)) return inverse;
+
+        // Equilibrate the rows before identifying dependent directions. A small but
+        // independent row must not disappear merely because another row is much stronger.
+        Real x = matrix.M11 > 0 ? MathR.Sqrt(matrix.M11) : 0;
+        Real y = matrix.M22 > 0 ? MathR.Sqrt(matrix.M22) : 0;
+        Real z = matrix.M33 > 0 ? MathR.Sqrt(matrix.M33) : 0;
+        if (x == 0 && y == 0 && z == 0) return JMatrix.Zero;
+        Real xy = x > 0 && y > 0 ? matrix.M12 / x / y : 0;
+        Real xz = x > 0 && z > 0 ? matrix.M13 / x / z : 0;
+        Real yz = y > 0 && z > 0 ? matrix.M23 / y / z : 0;
+        // Zero rows have no coupling. A unit diagonal lets an independent bilateral
+        // block use the ordinary inverse; its artificial response is removed below.
+        JMatrix normalized = new(1, xy, xz, xy, 1, yz, xz, yz, 1);
+        JMatrix response = PseudoInverseSymmetric(normalized);
+        xy = x > 0 && y > 0 ? response.M12 / x / y : 0;
+        xz = x > 0 && z > 0 ? response.M13 / x / z : 0;
+        yz = y > 0 && z > 0 ? response.M23 / y / z : 0;
+
+        // This is a generalized inverse in the equilibrated row metric; the public
+        // pseudoinverse retains its Moore-Penrose definition in the original metric.
+        JMatrix result = new(
+            x > 0 ? response.M11 / x / x : 0,
+            xy, xz, xy,
+            y > 0 ? response.M22 / y / y : 0,
+            yz, xz, yz,
+            z > 0 ? response.M33 / z / z : 0);
+        // An unrepresentable inverse must not introduce infinities into the solver.
+        return Real.IsFinite(result.M11) && Real.IsFinite(result.M12) && Real.IsFinite(result.M13) &&
+               Real.IsFinite(result.M22) && Real.IsFinite(result.M23) && Real.IsFinite(result.M33)
+            ? result : JMatrix.Zero;
+    }
+
+    /// <summary>Packs the inverse of the first two response rows as (M11, M12, M22).</summary>
+    internal static JVector InverseBilateralBlock(in JMatrix matrix)
+    {
+        JMatrix block = new(matrix.M11, matrix.M12, 0, matrix.M12, matrix.M22, 0, 0, 0, 0);
+        JMatrix inverse = InverseSymmetric(block);
+        return new JVector(inverse.M11, inverse.M12, inverse.M22);
+    }
+
+    private static bool JacobiRotate(Span<Real> a, Span<Real> basis, int p, int q, Real tolerance)
+    {
+        Real offDiagonal = a[3 * p + q];
+        if (MathR.Abs(offDiagonal) <= tolerance) return false;
+
+        Real tau = (a[3 * q + q] - a[3 * p + p]) / ((Real)2.0 * offDiagonal);
+        Real tangent = MathR.CopySign((Real)1.0, tau) /
+                       (MathR.Abs(tau) + MathR.Sqrt((Real)1.0 + tau * tau));
+        Real cosine = (Real)1.0 / MathR.Sqrt((Real)1.0 + tangent * tangent);
+        Real sine = tangent * cosine;
+
+        a[3 * p + p] -= tangent * offDiagonal;
+        a[3 * q + q] += tangent * offDiagonal;
+        a[3 * p + q] = a[3 * q + p] = 0;
+
+        for (int k = 0; k < 3; k++)
+        {
+            if (k != p && k != q)
+            {
+                Real akp = a[3 * k + p];
+                Real akq = a[3 * k + q];
+                a[3 * k + p] = a[3 * p + k] = cosine * akp - sine * akq;
+                a[3 * k + q] = a[3 * q + k] = sine * akp + cosine * akq;
+            }
+
+            Real vkp = basis[3 * k + p];
+            Real vkq = basis[3 * k + q];
+            basis[3 * k + p] = cosine * vkp - sine * vkq;
+            basis[3 * k + q] = sine * vkp + cosine * vkq;
+        }
+
+        return true;
     }
 
     /// <summary>

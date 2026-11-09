@@ -22,16 +22,13 @@ namespace Jitter2;
 public enum SolveMode
 {
     /// <summary>
-    /// Standard parallel solver. Contacts and constraints are distributed across threads
-    /// in fixed-size batches. An incremental cache-friendly reorder pass keeps related
-    /// contacts adjacent in memory. Fast, but non-deterministic.
+    /// The default solver, optimized for speed. Multithreaded results may vary between runs.
     /// </summary>
     Regular,
 
     /// <summary>
-    /// Island-based deterministic solver. Each simulation island is solved sequentially
-    /// as an independent task. Islands are distributed across threads, so multithreading
-    /// is still used. This mode can be significantly slower than <see cref="Regular"/>.
+    /// Solves contacts and constraints in a repeatable order. Groups of connected bodies can
+    /// still be solved in parallel. Can be significantly slower than <see cref="Regular"/>.
     /// </summary>
     Deterministic
 }
@@ -42,9 +39,11 @@ public sealed partial class World
 
     /// <summary>
     /// The solver strategy used during <see cref="Step"/>. Defaults to <see cref="Jitter2.SolveMode.Regular"/>.
-    /// <remarks> <see cref="Jitter2.SolveMode.Deterministic"/> can be significantly slower than
-    /// <see cref="Jitter2.SolveMode.Regular"/>.</remarks>
     /// </summary>
+    /// <remarks>
+    /// <see cref="Jitter2.SolveMode.Deterministic"/> can be significantly slower than
+    /// <see cref="Jitter2.SolveMode.Regular"/>.
+    /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">Thrown when an undefined <see cref="Jitter2.SolveMode"/>
     /// value is assigned.</exception>
     public SolveMode SolveMode
@@ -94,7 +93,7 @@ public sealed partial class World
         public ulong ConstraintId;
     }
 
-    // Maps RigidBodyData._index → island SetIndex. Cleared each frame; capacity grows on demand but is not trimmed.
+    // Maps RigidBodyData._index to island SetIndex. Cleared each frame; capacity grows on demand and can be reduced by Trim().
     private readonly Dictionary<int, int> handleToIsland = new();
 
     // Per-frame island ranges built from the sorted buffers.
@@ -102,6 +101,9 @@ public sealed partial class World
     private readonly List<ContactEntry> sortedContacts = new();
     private readonly List<SmallConstraintEntry> sortedSmallConstraints = new();
     private readonly List<ConstraintEntry> sortedConstraints = new();
+
+    private int islandSolverIterations;
+    private int islandRelaxationIterations;
 
     // -------------------------------------------------------------------------
     // Build island lookup.
@@ -215,18 +217,18 @@ public sealed partial class World
         {
             // Find the lowest island index among the three current scan positions.
             int minIsland = int.MaxValue;
-            if (ci < contacts.Length)    minIsland = Math.Min(minIsland, contacts[ci].IslandIndex);
-            if (si < small.Length)       minIsland = Math.Min(minIsland, small[si].IslandIndex);
+            if (ci < contacts.Length) minIsland = Math.Min(minIsland, contacts[ci].IslandIndex);
+            if (si < small.Length) minIsland = Math.Min(minIsland, small[si].IslandIndex);
             if (ri < constraints.Length) minIsland = Math.Min(minIsland, constraints[ri].IslandIndex);
 
             IslandRange range = new();
 
             range.ContactStart = ci;
-            while (ci < contacts.Length    && contacts[ci].IslandIndex    == minIsland) ci++;
+            while (ci < contacts.Length && contacts[ci].IslandIndex == minIsland) ci++;
             range.ContactEnd = ci;
 
             range.SmallStart = si;
-            while (si < small.Length       && small[si].IslandIndex       == minIsland) si++;
+            while (si < small.Length && small[si].IslandIndex == minIsland) si++;
             range.SmallEnd = si;
 
             range.ConstraintStart = ri;
@@ -262,26 +264,26 @@ public sealed partial class World
             for (int i = 0; i < contacts.Length; i++)
             {
                 ref ContactData c = ref allContacts[contacts[i].Index];
-                c.PrepareForIteration(invStepDt);
+                c.PrepareForIteration(timeStep);
             }
 
             for (int i = 0; i < constraints.Length; i++)
             {
                 ref ConstraintData c = ref constraints[i].Handle.Data;
                 if (c.IsEnabled)
-                    c.PrepareForIteration(ref c, invStepDt);
+                    c.PrepareForIteration(ref c, timeStep);
             }
 
             for (int i = 0; i < small.Length; i++)
             {
                 ref SmallConstraintData c = ref small[i].Handle.Data;
                 if (c.IsEnabled)
-                    c.PrepareForIteration(ref c, invStepDt);
+                    c.PrepareForIteration(ref c, timeStep);
             }
 
             // --- Iterate ---
 
-            for (int iter = 0; iter < solverIterations; iter++)
+            for (int iter = 0; iter < islandSolverIterations; iter++)
             {
                 for (int i = 0; i < contacts.Length; i++)
                 {
@@ -293,14 +295,14 @@ public sealed partial class World
                 {
                     ref ConstraintData c = ref constraints[i].Handle.Data;
                     if (c.IsEnabled)
-                        c.Iterate(ref c, invStepDt);
+                        c.Iterate(ref c, timeStep);
                 }
 
                 for (int i = 0; i < small.Length; i++)
                 {
                     ref SmallConstraintData c = ref small[i].Handle.Data;
                     if (c.IsEnabled)
-                        c.Iterate(ref c, invStepDt);
+                        c.Iterate(ref c, timeStep);
                 }
             }
 
@@ -317,7 +319,7 @@ public sealed partial class World
             IslandRange range = islandRanges[idx];
             var contacts = orderedContacts[range.ContactStart..range.ContactEnd];
 
-            for (int iter = 0; iter < velocityRelaxations; iter++)
+            for (int iter = 0; iter < islandRelaxationIterations; iter++)
             {
                 for (int i = 0; i < contacts.Length; i++)
                 {
@@ -339,13 +341,14 @@ public sealed partial class World
         BuildIslandRanges();
     }
 
-    private void RelaxIslands()
+    private void RelaxIslands(bool multiThread, int iterations)
     {
+        islandRelaxationIterations = iterations;
+
         int numIslands = islandRanges.Count;
         if (numIslands == 0) return;
 
-        int numThreads = ThreadPool.Instance.ThreadCount;
-        int numTasks = Math.Min(numIslands, numThreads);
+        int numTasks = multiThread ? Math.Min(numIslands, ThreadPool.Instance.ThreadCount) : 1;
 
         if (numTasks <= 1)
         {
@@ -356,13 +359,14 @@ public sealed partial class World
         Parallel.ForBatch(0, numIslands, numTasks, relaxIsland);
     }
 
-    private void SolveIslands(int iterations)
+    private void SolveIslands(bool multiThread, int iterations)
     {
+        islandSolverIterations = iterations;
+
         int numIslands = islandRanges.Count;
         if (numIslands == 0) return;
 
-        int numThreads = ThreadPool.Instance.ThreadCount;
-        int numTasks = Math.Min(numIslands, numThreads);
+        int numTasks = multiThread ? Math.Min(numIslands, ThreadPool.Instance.ThreadCount) : 1;
 
         if (numTasks <= 1)
         {

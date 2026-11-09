@@ -7,6 +7,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -127,6 +128,11 @@ internal unsafe class PairHashSet : IEnumerable<PairHashSet.Pair>
     public const int TrimFactor = 8;
 
     /// <summary>
+    /// Factor used to leave growth headroom after shrinking the hash set.
+    /// </summary>
+    public const int TrimTargetFactor = 4;
+
+    /// <summary>
     /// Gets the number of pairs in the hash set.
     /// </summary>
     public int Count => count;
@@ -180,7 +186,7 @@ internal unsafe class PairHashSet : IEnumerable<PairHashSet.Pair>
             }
         }
 
-        Slots = newSlots;
+        Volatile.Write(ref Slots, newSlots);
     }
 
     private static int FindSlot(Pair[] slots, int hash, long id)
@@ -192,6 +198,29 @@ internal unsafe class PairHashSet : IEnumerable<PairHashSet.Pair>
         while (true)
         {
             if (slots[hash].ID == 0 || slots[hash].ID == id) return hash;
+            hash = (hash + 1) & modder;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long ReadConcurrentId(Pair[] slots, int index)
+    {
+        // ConcurrentAdd publishes IDs with an atomic 64-bit compare-exchange. Native
+        // 64-bit loads are atomic, but a regular long read may tear in a 32-bit process.
+        if (Environment.Is64BitProcess) return slots[index].ID;
+        return Interlocked.Read(ref Unsafe.As<Pair, long>(ref slots[index]));
+    }
+
+    private static int FindSlotConcurrent(Pair[] slots, int hash, long id, out long slotId)
+    {
+        int modder = slots.Length - 1;
+
+        hash &= modder;
+
+        while (true)
+        {
+            slotId = ReadConcurrentId(slots, hash);
+            if (slotId == 0 || slotId == id) return hash;
             hash = (hash + 1) & modder;
         }
     }
@@ -237,7 +266,7 @@ internal unsafe class PairHashSet : IEnumerable<PairHashSet.Pair>
         return false;
     }
 
-    private Jitter2.Parallelization.ReaderWriterLock rwLock;
+    private readonly Jitter2.Parallelization.ReaderWriterLock rwLock = new();
 
     /// <summary>
     /// Attempts to add a pair to the hash set in a thread-safe manner.
@@ -255,19 +284,21 @@ internal unsafe class PairHashSet : IEnumerable<PairHashSet.Pair>
 
         // Fast path: This is a *huge* optimization in case of frequent additions
         // of already existing entries. Entirely bypassing any locks or synchronization.
-        int fpHashIndex = FindSlot(Slots, hash, pair.ID);
-        if (Slots[fpHashIndex].ID != 0) return false;
+        Pair[] fpSlots = Volatile.Read(ref Slots);
+        _ = FindSlotConcurrent(fpSlots, hash, pair.ID, out long fpSlotId);
+        if (fpSlotId == pair.ID) return false;
 
         rwLock.EnterReadLock();
 
-        fixed (Pair* slotsPtr = Slots)
+        Pair[] slots = Slots;
+        fixed (Pair* slotsPtr = slots)
         {
             while (true)
             {
-                var hashIndex = FindSlot(Slots, hash, pair.ID);
+                var hashIndex = FindSlotConcurrent(slots, hash, pair.ID, out long slotId);
                 var slotPtr = &slotsPtr[hashIndex];
 
-                if (slotPtr->ID == pair.ID)
+                if (slotId == pair.ID)
                 {
                     rwLock.ExitReadLock();
                     return false;
@@ -281,17 +312,23 @@ internal unsafe class PairHashSet : IEnumerable<PairHashSet.Pair>
                 Interlocked.Increment(ref count);
                 rwLock.ExitReadLock();
 
-                if (Slots.Length < 2 * count)
+                Pair[] currentSlots = Volatile.Read(ref Slots);
+                if (currentSlots.Length < 2 * count)
                 {
                     rwLock.EnterWriteLock();
 
-                    // check if another thread already performed a resize.
-                    if (Slots.Length < 2 * count)
+                    try
                     {
-                        Resize(PickSize(Slots.Length * 2));
+                        // Check if another thread already performed a resize.
+                        if (Slots.Length < 2 * count)
+                        {
+                            Resize(PickSize(Slots.Length * 2));
+                        }
                     }
-
-                    rwLock.ExitWriteLock();
+                    finally
+                    {
+                        rwLock.ExitWriteLock();
+                    }
                 }
 
                 return true;
@@ -340,7 +377,7 @@ internal unsafe class PairHashSet : IEnumerable<PairHashSet.Pair>
 
         if (Slots.Length > MinimumSize && count * TrimFactor < Slots.Length)
         {
-            Resize(PickSize(count * 2));
+            Resize(PickSize(count * TrimTargetFactor));
         }
 
         return true;
@@ -359,9 +396,14 @@ internal unsafe class PairHashSet : IEnumerable<PairHashSet.Pair>
     }
 
     /// <inheritdoc/>
-    public IEnumerator<Pair> GetEnumerator()
+    public Enumerator GetEnumerator()
     {
         return new Enumerator(this);
+    }
+
+    IEnumerator<Pair> IEnumerable<Pair>.GetEnumerator()
+    {
+        return GetEnumerator();
     }
 
     IEnumerator IEnumerable.GetEnumerator()

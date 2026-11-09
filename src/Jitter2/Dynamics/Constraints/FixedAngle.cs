@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Jitter2.LinearMath;
@@ -12,10 +13,13 @@ using Jitter2.Unmanaged;
 namespace Jitter2.Dynamics.Constraints;
 
 /// <summary>
-/// Constrains the relative orientation between two bodies, eliminating three degrees of rotational freedom.
+/// Preserves the relative orientation of two bodies while leaving translation free.
 /// </summary>
 public unsafe class FixedAngle : Constraint<FixedAngle.FixedAngleData>
 {
+    /// <inheritdoc />
+    public override string ToString() => FormatDescription(nameof(FixedAngle));
+
     [StructLayout(LayoutKind.Sequential)]
     public struct FixedAngleData
     {
@@ -41,6 +45,7 @@ public unsafe class FixedAngle : Constraint<FixedAngle.FixedAngleData>
         public JMatrix Jacobian;
 
         public ushort Clamp;
+        public short Hemisphere;
     }
 
     private static readonly uint RegisteredDispatchId =
@@ -59,7 +64,6 @@ public unsafe class FixedAngle : Constraint<FixedAngle.FixedAngleData>
     /// Initializes the constraint using the current relative orientation of the bodies.
     /// </summary>
     /// <remarks>
-    /// Records the current relative orientation as the target.
     /// Default values: <see cref="Softness"/> = <see cref="Constraint.DefaultAngularSoftness"/>, <see cref="Bias"/> = <see cref="Constraint.DefaultAngularBias"/>.
     /// </remarks>
     public void Initialize()
@@ -78,7 +82,7 @@ public unsafe class FixedAngle : Constraint<FixedAngle.FixedAngleData>
         data.Q0 = q2.Conjugate() * q1;
     }
 
-    public static void PrepareForIterationFixedAngle(ref ConstraintData constraint, Real idt)
+    public static void PrepareForIterationFixedAngle(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, FixedAngleData>(ref constraint);
 
@@ -88,32 +92,35 @@ public unsafe class FixedAngle : Constraint<FixedAngle.FixedAngleData>
         JQuaternion q1 = body1.Orientation;
         JQuaternion q2 = body2.Orientation;
 
-        JQuaternion quat0 = data.Q0 * q1.Conjugate() * q2;
-
-        JVector error = new(quat0.X, quat0.Y, quat0.Z);
-
         data.Clamp = 1024;
 
-        data.Jacobian = QMatrix.ProjectMultiplyLeftRight(data.Q0 * q1.Conjugate(), q2);
+        // Use small-angle scaling with a nonsingular rotation
+        // coordinate instead of the quaternion vector part at large rotations.
+        data.Jacobian = -(Real)2 * AngularConstraintMath.CalculateJacobian(
+            data.Q0 * q1.Conjugate(), q2, out JVector error, out short hemisphere);
+        if (data.Hemisphere != 0 && data.Hemisphere != hemisphere)
+            data.AccumulatedImpulse = JVector.Zero;
+        data.Hemisphere = hemisphere;
 
-        if (quat0.W < (Real)0.0)
+        data.EffectiveMass = JSymmetricMatrix.Transform(body1.InverseInertiaWorld + body2.InverseInertiaWorld,
+            data.Jacobian).ToMatrix();
+
+        data.EffectiveMass.M11 += data.Softness * timeStep.InverseSubstepDt;
+        data.EffectiveMass.M22 += data.Softness * timeStep.InverseSubstepDt;
+        data.EffectiveMass.M33 += data.Softness * timeStep.InverseSubstepDt;
+
+        data.EffectiveMass = MathHelper.InverseSymmetric(data.EffectiveMass);
+
+        data.Bias = -error * data.BiasFactor * timeStep.InverseStepDt;
+
+        if (body1.MotionType == MotionType.Dynamic)
         {
-            error *= -(Real)1.0;
-            data.Jacobian *= -(Real)1.0;
+            body1.AngularVelocity += JVector.Transform(JVector.TransposedTransform(data.AccumulatedImpulse, data.Jacobian), body1.InverseInertiaWorld);
         }
-
-        data.EffectiveMass = JMatrix.Multiply(data.Jacobian, JMatrix.MultiplyTransposed(body1.InverseInertiaWorld + body2.InverseInertiaWorld, data.Jacobian));
-
-        data.EffectiveMass.M11 += data.Softness * idt;
-        data.EffectiveMass.M22 += data.Softness * idt;
-        data.EffectiveMass.M33 += data.Softness * idt;
-
-        JMatrix.Inverse(data.EffectiveMass, out data.EffectiveMass);
-
-        data.Bias = -error * data.BiasFactor * idt;
-
-        body1.AngularVelocity += JVector.Transform(JVector.TransposedTransform(data.AccumulatedImpulse, data.Jacobian), body1.InverseInertiaWorld);
-        body2.AngularVelocity -= JVector.Transform(JVector.TransposedTransform(data.AccumulatedImpulse, data.Jacobian), body2.InverseInertiaWorld);
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.AngularVelocity -= JVector.Transform(JVector.TransposedTransform(data.AccumulatedImpulse, data.Jacobian), body2.InverseInertiaWorld);
+        }
     }
 
     /// <summary>
@@ -125,64 +132,66 @@ public unsafe class FixedAngle : Constraint<FixedAngle.FixedAngleData>
     public Real Softness
     {
         get => Data.Softness;
-        set => Data.Softness = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.Softness = value;
+        }
     }
 
     /// <summary>
     /// Gets or sets the bias factor controlling how aggressively angular error is corrected.
     /// </summary>
     /// <value>
-    /// Default is 0.2. Range [0, 1]. Higher values correct errors faster but may cause instability.
+    /// Default is 0.2. Higher values correct errors faster but may cause instability.
     /// </value>
     public Real Bias
     {
         get => Data.BiasFactor;
-        set => Data.BiasFactor = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.BiasFactor = value;
+        }
     }
 
     /// <summary>
-    /// Gets the accumulated impulse applied by this constraint during the last step.
+    /// Gets the accumulated solver impulse from the last solved substep.
     /// </summary>
     public JVector Impulse => Data.AccumulatedImpulse;
 
-    public static void IterateFixedAngle(ref ConstraintData constraint, Real idt)
+    public static void IterateFixedAngle(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, FixedAngleData>(ref constraint);
         ref RigidBodyData body1 = ref constraint.Body1.Data;
         ref RigidBodyData body2 = ref constraint.Body2.Data;
 
         JVector jv = JVector.Transform(body1.AngularVelocity - body2.AngularVelocity, data.Jacobian);
-        JVector softness = data.AccumulatedImpulse * (data.Softness * idt);
+        JVector softness = data.AccumulatedImpulse * (data.Softness * timeStep.InverseSubstepDt);
         JVector lambda = -(Real)1.0 * JVector.Transform(jv + data.Bias + softness, data.EffectiveMass);
 
         data.AccumulatedImpulse += lambda;
 
-        body1.AngularVelocity += JVector.Transform(JVector.TransposedTransform(lambda, data.Jacobian), body1.InverseInertiaWorld);
-        body2.AngularVelocity -= JVector.Transform(JVector.TransposedTransform(lambda, data.Jacobian), body2.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.AngularVelocity += JVector.Transform(JVector.TransposedTransform(lambda, data.Jacobian), body1.InverseInertiaWorld);
+        }
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.AngularVelocity -= JVector.Transform(JVector.TransposedTransform(lambda, data.Jacobian), body2.InverseInertiaWorld);
+        }
     }
 
-    public override void DebugDraw(IDebugDrawer drawer)
+    public override void DebugDraw(IDebugDrawer drawer) => DebugDraw(drawer, DebugDrawSettings.Default);
+
+    /// <inheritdoc />
+    public override void DebugDraw(IDebugDrawer drawer, in DebugDrawSettings settings)
     {
-        ref FixedAngleData data = ref Data;
-        ref RigidBodyData body1 = ref data.Body1.Data;
-        ref RigidBodyData body2 = ref data.Body2.Data;
-
-        const Real axisLength = (Real)0.5;
-
-        JVector x1 = body1.Orientation.GetBasisX() * axisLength;
-        JVector y1 = body1.Orientation.GetBasisY() * axisLength;
-        JVector z1 = body1.Orientation.GetBasisZ() * axisLength;
-
-        JVector x2 = body2.Orientation.GetBasisX() * axisLength;
-        JVector y2 = body2.Orientation.GetBasisY() * axisLength;
-        JVector z2 = body2.Orientation.GetBasisZ() * axisLength;
-
-        drawer.DrawSegment(body1.Position, body1.Position + x1);
-        drawer.DrawSegment(body1.Position, body1.Position + y1);
-        drawer.DrawSegment(body1.Position, body1.Position + z1);
-
-        drawer.DrawSegment(body2.Position, body2.Position + x2);
-        drawer.DrawSegment(body2.Position, body2.Position + y2);
-        drawer.DrawSegment(body2.Position, body2.Position + z2);
+        ArgumentNullException.ThrowIfNull(drawer);
+        VerifyNotZero();
+        if (Body1 != Body1.World.NullBody)
+            drawer.DrawFrame(Body1.Position, Body1.Orientation, settings);
+        if (Body2 != Body2.World.NullBody)
+            drawer.DrawFrame(Body2.Position, Body2.Orientation * Data.Q0, settings);
     }
 }

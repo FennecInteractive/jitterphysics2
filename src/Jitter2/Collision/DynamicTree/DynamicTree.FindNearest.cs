@@ -52,8 +52,7 @@ public partial class DynamicTree
     public delegate bool FindNearestFilterPre(IDynamicTreeProxy proxy);
 
     /// <summary>
-    /// Convenience overload of <see cref="FindNearest{T}(in T, in JQuaternion, in JVector, FindNearestFilterPre?, FindNearestFilterPost?, out IDynamicTreeProxy?, out JVector, out JVector, out JVector, out Real)"/>
-    /// that queries with a <see cref="SupportPrimitives.Point"/>.
+    /// Finds the nearest accepted object to a point in world space.
     /// </summary>
     public bool FindNearestPoint(in JVector position,
         FindNearestFilterPre? pre, FindNearestFilterPost? post,
@@ -62,8 +61,7 @@ public partial class DynamicTree
             out proxy, out pointA, out pointB, out normal, out distance);
 
     /// <summary>
-    /// Convenience overload of <see cref="FindNearest{T}(in T, in JQuaternion, in JVector, Real, FindNearestFilterPre?, FindNearestFilterPost?, out IDynamicTreeProxy?, out JVector, out JVector, out JVector, out Real)"/>
-    /// that queries with a <see cref="SupportPrimitives.Point"/>.
+    /// Finds the nearest accepted object to a point in world space.
     /// </summary>
     public bool FindNearestPoint(in JVector position, Real maxDistance,
         FindNearestFilterPre? pre, FindNearestFilterPost? post,
@@ -72,10 +70,17 @@ public partial class DynamicTree
             out proxy, out pointA, out pointB, out normal, out distance);
 
     /// <summary>
-    /// Convenience overload of <see cref="FindNearest{T}(in T, in JQuaternion, in JVector, FindNearestFilterPre?, FindNearestFilterPost?, out IDynamicTreeProxy?, out JVector, out JVector, out JVector, out Real)"/>
-    /// that queries with a <see cref="SupportPrimitives.Sphere"/>.
+    /// Finds the nearest accepted object to a sphere.
     /// </summary>
     /// <param name="radius">The sphere radius.</param>
+    /// <param name="position">The query shape position in world space.</param>
+    /// <param name="pre">Optional filter applied before the exact test.</param>
+    /// <param name="post">Optional filter applied after the exact test.</param>
+    /// <param name="proxy">The accepted proxy, or null if none is found.</param>
+    /// <param name="pointA">The closest point on the query shape in world space.</param>
+    /// <param name="pointB">The closest point on the found proxy in world space.</param>
+    /// <param name="normal">Unit direction toward the found proxy, or zero for overlapping shapes.</param>
+    /// <param name="distance">The separation distance to the found proxy.</param>
     public bool FindNearestSphere(Real radius, in JVector position,
         FindNearestFilterPre? pre, FindNearestFilterPost? post,
         out IDynamicTreeProxy? proxy, out JVector pointA, out JVector pointB, out JVector normal, out Real distance) =>
@@ -83,10 +88,18 @@ public partial class DynamicTree
             out proxy, out pointA, out pointB, out normal, out distance);
 
     /// <summary>
-    /// Convenience overload of <see cref="FindNearest{T}(in T, in JQuaternion, in JVector, Real, FindNearestFilterPre?, FindNearestFilterPost?, out IDynamicTreeProxy?, out JVector, out JVector, out JVector, out Real)"/>
-    /// that queries with a <see cref="SupportPrimitives.Sphere"/>.
+    /// Finds the nearest accepted object to a sphere.
     /// </summary>
     /// <param name="radius">The sphere radius.</param>
+    /// <param name="position">The query shape position in world space.</param>
+    /// <param name="maxDistance">The maximum separation distance to consider.</param>
+    /// <param name="pre">Optional filter applied before the exact test.</param>
+    /// <param name="post">Optional filter applied after the exact test.</param>
+    /// <param name="proxy">The accepted proxy, or null if none is found.</param>
+    /// <param name="pointA">The closest point on the query shape in world space.</param>
+    /// <param name="pointB">The closest point on the found proxy in world space.</param>
+    /// <param name="normal">Unit direction toward the found proxy, or zero for overlapping shapes.</param>
+    /// <param name="distance">The separation distance to the found proxy.</param>
     public bool FindNearestSphere(Real radius, in JVector position, Real maxDistance,
         FindNearestFilterPre? pre, FindNearestFilterPost? post,
         out IDynamicTreeProxy? proxy, out JVector pointA, out JVector pointB, out JVector normal, out Real distance) =>
@@ -95,7 +108,8 @@ public partial class DynamicTree
 
     private struct DistanceQuery(in JBoundingBox box, in JQuaternion orientation, in JVector position)
     {
-        public readonly JBoundingBox Box = box;
+        public readonly JVector BoxExtents = (box.Max - box.Min) * (Real)0.5;
+        public readonly JVector BoxCenter = (box.Max + box.Min) * (Real)0.5;
         public readonly JQuaternion Orientation = orientation;
         public readonly JVector Position = position;
 
@@ -151,10 +165,19 @@ public partial class DynamicTree
     }
 
     /// <summary>
-    /// Bounded variant of <see cref="FindNearest{T}(in T, in JQuaternion, in JVector, FindNearestFilterPre?, FindNearestFilterPost?, out IDynamicTreeProxy?, out JVector, out JVector, out JVector, out Real)"/>
-    /// that limits the search to <paramref name="maxDistance"/>.
+    /// Finds the nearest accepted object within <paramref name="maxDistance"/> of the query shape.
     /// </summary>
+    /// <param name="support">The query shape.</param>
+    /// <param name="orientation">The query shape orientation in world space.</param>
+    /// <param name="position">The query shape position in world space.</param>
     /// <param name="maxDistance">Maximum separation distance to consider. Proxies farther than this are ignored.</param>
+    /// <param name="pre">Optional filter applied before the exact test.</param>
+    /// <param name="post">Optional filter applied after the exact test.</param>
+    /// <param name="proxy">The accepted proxy, or null if none is found.</param>
+    /// <param name="pointA">The closest point on the query shape in world space.</param>
+    /// <param name="pointB">The closest point on the found proxy in world space.</param>
+    /// <param name="normal">Unit direction toward the found proxy, or zero for overlapping shapes.</param>
+    /// <param name="distance">The separation distance to the found proxy.</param>
     public bool FindNearest<T>(in T support, in JQuaternion orientation, in JVector position, Real maxDistance,
         FindNearestFilterPre? pre, FindNearestFilterPost? post,
         out IDynamicTreeProxy? proxy, out JVector pointA, out JVector pointB, out JVector normal, out Real distance)
@@ -181,14 +204,11 @@ public partial class DynamicTree
     // Returns the minimum distance between the query AABB and a tree node's expanded AABB.
     // Uses the Minkowski sum: expand the target by the query half-extents, then measure
     // point-to-AABB distance from the query center. Returns 0 if the AABBs overlap.
-    private static Real MinDistBox(in JBoundingBox queryBox, in TreeBox targetBox)
+    private static Real MinDistBox(in JVector queryExtents, in JVector queryCenter, in TreeBox targetBox)
     {
-        JVector extents = (queryBox.Max - queryBox.Min) * (Real)0.5;
-        JVector center = (queryBox.Max + queryBox.Min) * (Real)0.5;
-
-        Real dx = MathR.Max(MathR.Max(targetBox.Min.X - extents.X - center.X, center.X - targetBox.Max.X - extents.X), (Real)0.0);
-        Real dy = MathR.Max(MathR.Max(targetBox.Min.Y - extents.Y - center.Y, center.Y - targetBox.Max.Y - extents.Y), (Real)0.0);
-        Real dz = MathR.Max(MathR.Max(targetBox.Min.Z - extents.Z - center.Z, center.Z - targetBox.Max.Z - extents.Z), (Real)0.0);
+        Real dx = MathR.Max(MathR.Max(targetBox.Min.X - queryExtents.X - queryCenter.X, queryCenter.X - targetBox.Max.X - queryExtents.X), (Real)0.0);
+        Real dy = MathR.Max(MathR.Max(targetBox.Min.Y - queryExtents.Y - queryCenter.Y, queryCenter.Y - targetBox.Max.Y - queryExtents.Y), (Real)0.0);
+        Real dz = MathR.Max(MathR.Max(targetBox.Min.Z - queryExtents.Z - queryCenter.Z, queryCenter.Z - targetBox.Max.Z - queryExtents.Z), (Real)0.0);
 
         return MathR.Sqrt(dx * dx + dy * dy + dz * dz);
     }
@@ -206,72 +226,79 @@ public partial class DynamicTree
             return false;
         }
 
-        _stack ??= new Stack<int>(256);
-        _stack.Push(root);
-
-        while (_stack.Count > 0)
+        Stack<int> stack = QueryStack;
+        int baseCount = stack.Count;
+        try
         {
-            int index = _stack.Pop();
-            ref Node node = ref nodes[index];
+            stack.Push(root);
 
-            if (node.IsLeaf)
+            while (stack.Count > baseCount)
             {
-                if (node.Proxy is not IDistanceTestable distCastable) continue;
-                if (query.FilterPre != null && !query.FilterPre(node.Proxy!)) continue;
+                int index = stack.Pop();
+                ref Node node = ref nodes[index];
 
-                Unsafe.SkipInit(out FindNearestResult res);
-                bool separated = distCastable.Distance(support,
-                    query.Orientation, query.Position,
-                    out res.PointA, out res.PointB, out res.Normal, out res.Distance);
-                res.Entity = node.Proxy;
-
-                if (!separated)
+                if (node.IsLeaf)
                 {
-                    res.Distance = (Real)0.0;
-                    res.Normal = JVector.Zero;
+                    IDynamicTreeProxy proxy = node.Proxy!;
+                    if (proxy is not IDistanceTestable distanceTestable) continue;
+                    if (query.FilterPre != null && !query.FilterPre(proxy)) continue;
+
+                    Unsafe.SkipInit(out FindNearestResult res);
+                    bool separated = distanceTestable.Distance(support,
+                        query.Orientation, query.Position,
+                        out res.PointA, out res.PointB, out res.Normal, out res.Distance);
+                    res.Entity = proxy;
+
+                    if (!separated)
+                    {
+                        res.Distance = (Real)0.0;
+                        res.Normal = JVector.Zero;
+                        if (query.FilterPost != null && !query.FilterPost(res)) continue;
+                        result = res;
+                        return true;
+                    }
+
+                    if (res.Distance > result.Distance) continue;
                     if (query.FilterPost != null && !query.FilterPost(res)) continue;
-                    _stack.Clear();
+
                     result = res;
-                    return true;
+                    continue;
                 }
 
-                if (res.Distance > result.Distance) continue;
-                if (query.FilterPost != null && !query.FilterPost(res)) continue;
+                ref Node leftNode = ref nodes[node.Left];
+                ref Node rightNode = ref nodes[node.Right];
 
-                result = res;
-                continue;
-            }
+                Real leftDist = MinDistBox(query.BoxExtents, query.BoxCenter, leftNode.ExpandedBox);
+                Real rightDist = MinDistBox(query.BoxExtents, query.BoxCenter, rightNode.ExpandedBox);
 
-            ref Node leftNode = ref nodes[node.Left];
-            ref Node rightNode = ref nodes[node.Right];
+                bool leftHit = leftDist <= result.Distance;
+                bool rightHit = rightDist <= result.Distance;
 
-            Real leftDist = MinDistBox(query.Box, leftNode.ExpandedBox);
-            Real rightDist = MinDistBox(query.Box, rightNode.ExpandedBox);
-
-            bool leftHit = leftDist <= result.Distance;
-            bool rightHit = rightDist <= result.Distance;
-
-            if (leftHit && rightHit)
-            {
-                if (leftDist < rightDist)
+                if (leftHit && rightHit)
                 {
-                    _stack.Push(node.Right);
-                    _stack.Push(node.Left);
+                    if (leftDist < rightDist)
+                    {
+                        stack.Push(node.Right);
+                        stack.Push(node.Left);
+                    }
+                    else
+                    {
+                        stack.Push(node.Left);
+                        stack.Push(node.Right);
+                    }
                 }
                 else
                 {
-                    _stack.Push(node.Left);
-                    _stack.Push(node.Right);
+                    if (leftHit) stack.Push(node.Left);
+                    if (rightHit) stack.Push(node.Right);
                 }
             }
-            else
-            {
-                if (leftHit) _stack.Push(node.Left);
-                if (rightHit) _stack.Push(node.Right);
-            }
-        }
 
-        _stack.Clear();
-        return result.Entity != null;
+            return result.Entity != null;
+        }
+        finally
+        {
+            PopTo(stack, baseCount);
+        }
     }
 }

@@ -12,14 +12,16 @@ using Jitter2.LinearMath;
 namespace Jitter2.Collision.Shapes;
 
 /// <summary>
-/// Represents a convex hull shape defined by a point cloud. Unlike <see cref="ConvexHullShape"/>,
-/// it is not necessary for the points to lie on the convex hull. For performance optimization,
-/// this shape should ideally be used for a small number of points (~300).
+/// Represents the convex hull of a set of points, which may include interior points.
 /// </summary>
+/// <remarks>
+/// Best suited to small point sets (roughly 300 points or fewer). For larger hulls,
+/// consider <see cref="ConvexHullShape"/>.
+/// </remarks>
 public class PointCloudShape : RigidBodyShape, ICloneableShape<PointCloudShape>
 {
     private JBoundingBox cachedBoundingBox;
-    private JMatrix cachedInertia;
+    private JSymmetricMatrix cachedInertia;
     private Real cachedMass;
     private JVector cachedCenter;
 
@@ -28,7 +30,7 @@ public class PointCloudShape : RigidBodyShape, ICloneableShape<PointCloudShape>
 
     /// <inheritdoc cref="PointCloudShape(ReadOnlySpan{JVector})"/>
     public PointCloudShape(IEnumerable<JVector> vertices) :
-        this(SpanHelper.AsReadOnlySpan(vertices, out _))
+        this(SpanHelper.AsReadOnlySpan(vertices))
     {
     }
 
@@ -39,6 +41,9 @@ public class PointCloudShape : RigidBodyShape, ICloneableShape<PointCloudShape>
     /// <exception cref="ArgumentException">
     /// Thrown when <paramref name="vertices"/> is empty.
     /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <paramref name="vertices"/> does not define a non-degenerate volume.
+    /// </exception>
     public PointCloudShape(ReadOnlySpan<JVector> vertices)
     {
         supportMap = new VertexSupportMap(vertices);
@@ -48,6 +53,9 @@ public class PointCloudShape : RigidBodyShape, ICloneableShape<PointCloudShape>
     /// <summary>
     /// Initializes a new instance of the <see cref="PointCloudShape"/> class.
     /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <paramref name="supportMap"/> does not define a non-degenerate volume.
+    /// </exception>
     public PointCloudShape(VertexSupportMap supportMap)
     {
         this.supportMap = supportMap;
@@ -59,8 +67,7 @@ public class PointCloudShape : RigidBodyShape, ICloneableShape<PointCloudShape>
     }
 
     /// <summary>
-    /// Creates a copy of this shape. The underlying data structure is shared
-    /// among the instances.
+    /// Creates a copy that shares the original vertex data.
     /// </summary>
     public PointCloudShape Clone()
     {
@@ -73,12 +80,12 @@ public class PointCloudShape : RigidBodyShape, ICloneableShape<PointCloudShape>
             cachedMass = cachedMass,
             shifted = shifted
         };
+        result.UpdateWorldBoundingBox();
         return result;
     }
 
     /// <summary>
-    /// Gets or sets the shift value for the shape. This property can be used when constructing a rigid
-    /// body that contains one or more shapes.
+    /// Gets or sets the offset added to the vertices in local coordinates.
     /// </summary>
     public JVector Shift
     {
@@ -93,22 +100,36 @@ public class PointCloudShape : RigidBodyShape, ICloneableShape<PointCloudShape>
     /// <summary>
     /// Updates the shape's cached mass, inertia, and bounding box.
     /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the point cloud does not define a non-degenerate volume.
+    /// </exception>
     public void UpdateShape()
     {
         CalculateMassInertia();
         CalcInitBox();
+        UpdateWorldBoundingBox();
     }
 
     /// <summary>
     /// Recalculates the mass, center of mass, and inertia tensor.
     /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the point cloud does not define a non-degenerate volume.
+    /// </exception>
     public void CalculateMassInertia()
     {
         ShapeHelper.CalculateMassInertia(this, out cachedInertia, out cachedCenter, out cachedMass);
+
+        const Real minimumMass = (Real)1e-12;
+
+        if (!Real.IsFinite(cachedMass) || cachedMass <= minimumMass)
+        {
+            throw new InvalidOperationException("Point cloud must define a non-degenerate volume.");
+        }
     }
 
     /// <inheritdoc/>
-    public override void CalculateMassInertia(out JMatrix inertia, out JVector com, out Real mass)
+    public override void CalculateMassInertia(out JSymmetricMatrix inertia, out JVector com, out Real mass)
     {
         inertia = cachedInertia;
         com = cachedCenter;

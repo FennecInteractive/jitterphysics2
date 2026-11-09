@@ -39,6 +39,9 @@ public partial struct JVector
     /// </remarks>
     /// <typeparam name="T">The target unmanaged type.</typeparam>
     /// <returns>The reinterpreted value.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <typeparamref name="T"/> does not have the same size as <see cref="JVector"/>.
+    /// </exception>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T UnsafeAs<T>() where T : unmanaged
     {
@@ -59,6 +62,9 @@ public partial struct JVector
     /// <typeparam name="T">The source unmanaged type.</typeparam>
     /// <param name="value">The value to reinterpret.</param>
     /// <returns>The reinterpreted vector.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <typeparamref name="T"/> does not have the same size as <see cref="JVector"/>.
+    /// </exception>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static JVector UnsafeFrom<T>(in T value) where T : unmanaged
     {
@@ -88,6 +94,9 @@ public partial struct JQuaternion
     /// </remarks>
     /// <typeparam name="T">The target unmanaged type.</typeparam>
     /// <returns>The reinterpreted value.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <typeparamref name="T"/> does not have the same size as <see cref="JQuaternion"/>.
+    /// </exception>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T UnsafeAs<T>() where T : unmanaged
     {
@@ -109,6 +118,9 @@ public partial struct JQuaternion
     /// <typeparam name="T">The source unmanaged type.</typeparam>
     /// <param name="value">The value to reinterpret.</param>
     /// <returns>The reinterpreted quaternion.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <typeparamref name="T"/> does not have the same size as <see cref="JQuaternion"/>.
+    /// </exception>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static JQuaternion UnsafeFrom<T>(in T value) where T : unmanaged
     {

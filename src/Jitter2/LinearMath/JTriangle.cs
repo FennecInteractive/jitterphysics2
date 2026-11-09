@@ -13,8 +13,8 @@ namespace Jitter2.LinearMath;
 /// <summary>
 /// Represents a triangle defined by three vertices.
 /// </summary>
-[StructLayout(LayoutKind.Explicit, Size = 9*sizeof(Real))]
-public struct JTriangle(in JVector v0, in JVector v1, in JVector v2) : IEquatable<JTriangle>
+[StructLayout(LayoutKind.Explicit, Size = 9 * sizeof(Real))]
+public struct JTriangle(in JVector v0, in JVector v1, in JVector v2) : IEquatable<JTriangle>, IFormattable
 {
     /// <summary>
     /// Specifies the face culling mode for triangles based on their winding order.
@@ -51,14 +51,17 @@ public struct JTriangle(in JVector v0, in JVector v1, in JVector v2) : IEquatabl
     [FieldOffset(6 * sizeof(Real))] public JVector V2 = v2;
 
     /// <summary>
-    /// Checks if a ray intersects the triangle.
+    /// Checks whether the line through the ray origin intersects the strict interior of the triangle.
+    /// This method can return an intersection behind the origin.
     /// </summary>
     /// <param name="origin">The starting point (origin) of the ray.</param>
     /// <param name="direction">The direction vector of the ray.</param>
     /// <param name="cullMode">Determines whether to ignore triangles based on their winding order (Front/Back facing).</param>
     /// <param name="normal">Output: The normalized surface normal at the point of intersection.</param>
-    /// <param name="lambda">Output: The distance along the <paramref name="direction"/> vector where the intersection occurs (hit point = origin + lambda * direction).</param>
-    /// <returns><c>true</c> if the ray intersects the triangle; otherwise, <c>false</c>.</returns>
+    /// <param name="lambda">Output: The signed ray parameter at the intersection
+    /// (hit point = origin + lambda * direction). It is not a distance if direction is not normalized.</param>
+    /// <returns><c>true</c> if the line intersects the triangle interior and passes the face-culling test;
+    /// otherwise, <c>false</c>. Hits exactly on an edge are excluded.</returns>
     public readonly bool RayIntersect(in JVector origin, in JVector direction, CullMode cullMode,
         out JVector normal, out Real lambda)
     {
@@ -70,9 +73,11 @@ public struct JTriangle(in JVector v0, in JVector v1, in JVector v2) : IEquatabl
 
         Real denominator = JVector.Dot(direction, normal);
 
-        if (Math.Abs(denominator) < (Real)1e-06)
+        // Triangle and ray are parallel: the cosine of the angle between direction and normal is
+        // below 1e-6. Comparing the cosine keeps the test independent of the lengths of the
+        // direction and of the triangle's edges. A degenerate triangle (zero normal) also ends here.
+        if (denominator * denominator <= (Real)1e-12 * direction.LengthSquared() * normal.LengthSquared())
         {
-            // triangle and ray are parallel
             goto return_false;
         }
 
@@ -104,7 +109,7 @@ public struct JTriangle(in JVector v0, in JVector v1, in JVector v2) : IEquatabl
             return true;
         }
 
-        return_false:
+    return_false:
 
         lambda = Real.MaxValue; normal = JVector.Zero;
         return false;
@@ -113,9 +118,18 @@ public struct JTriangle(in JVector v0, in JVector v1, in JVector v2) : IEquatabl
     /// <summary>
     /// Returns a string representation of the <see cref="JTriangle"/>.
     /// </summary>
-    public readonly override string ToString()
+    public readonly override string ToString() => ToString(null, null);
+
+    /// <summary>Formats the vertices using the specified numeric format and the current culture.</summary>
+    public readonly string ToString(string? format) => ToString(format, null);
+
+    /// <summary>Formats the vertices using the specified numeric format and culture.</summary>
+    /// <param name="format">A numeric format string, or null or empty to use the general format.</param>
+    /// <param name="formatProvider">The format provider, or null to use the current culture.</param>
+    public readonly string ToString(string? format, IFormatProvider? formatProvider)
     {
-        return $"V0={{{V0}}}, V1={{{V1}}}, V2={{{V2}}}";
+        return $"V0={{{V0.ToString(format, formatProvider)}}}, V1={{{V1.ToString(format, formatProvider)}}}, " +
+               $"V2={{{V2.ToString(format, formatProvider)}}}";
     }
 
     /// <summary>

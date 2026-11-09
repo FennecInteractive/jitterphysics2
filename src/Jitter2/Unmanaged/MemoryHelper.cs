@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -14,24 +15,20 @@ namespace Jitter2.Unmanaged;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Safety:</b> All pointers returned by allocation methods must be freed using
-/// the corresponding <see cref="Free(void*)"/> or <see cref="AlignedFree"/> method.
-/// Failure to do so will result in memory leaks.
+/// Free each allocation with the matching <see cref="Free(void*)"/> or <see cref="AlignedFree"/> method.
 /// </para>
 /// <para>
-/// <b>Threading:</b> These methods are thread-safe, but the caller is responsible
-/// for synchronizing access to the allocated memory.
+/// Allocation and deallocation are thread-safe. Synchronizing access to the allocated memory
+/// is the caller's responsibility.
 /// </para>
 /// </remarks>
 public static unsafe class MemoryHelper
 {
     /// <summary>
-    /// Represents an integer value isolated in memory to prevent false sharing
-    /// between multiple threads operating on adjacent data.
+    /// An integer padded on both sides so updates do not contend with adjacent data on a 64-byte cache line.
     /// </summary>
     /// <remarks>
-    /// The struct is padded to 132 bytes (64-byte padding on each side of the value)
-    /// to ensure the <see cref="Value"/> field resides on its own cache line.
+    /// The struct occupies 132 bytes, with 64 bytes of padding on each side of <see cref="Value"/>.
     /// </remarks>
     [StructLayout(LayoutKind.Explicit, Size = 132)]
     public struct IsolatedInt
@@ -47,38 +44,39 @@ public static unsafe class MemoryHelper
     }
 
     /// <summary>
-    /// A memory block with a size equivalent to six instances of the <see cref="Real"/> type.
+    /// An integer padded so adjacent array elements do not share a 64-byte cache line.
     /// </summary>
     /// <remarks>
-    /// The struct uses sequential layout and a fixed size to ensure consistent memory alignment and layout.
+    /// Use for arrays of counters. For standalone fields, use <see cref="IsolatedInt"/>.
     /// </remarks>
+    [StructLayout(LayoutKind.Explicit, Size = 128)]
+    public struct PaddedInt
+    {
+        [FieldOffset(0)]
+        public int Value;
+    }
+
+    /// <summary>
+    /// A memory block with a size equivalent to six instances of the <see cref="Real"/> type.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential, Size = 6 * sizeof(Real))]
     public struct MemBlock6Real { }
 
     /// <summary>
     /// A memory block with a size equivalent to nine instances of the <see cref="Real"/> type.
     /// </summary>
-    /// <remarks>
-    /// The struct uses sequential layout and a fixed size to ensure consistent memory alignment and layout.
-    /// </remarks>
     [StructLayout(LayoutKind.Sequential, Size = 9 * sizeof(Real))]
     public struct MemBlock9Real { }
 
     /// <summary>
     /// A memory block with a size equivalent to twelve instances of the <see cref="Real"/> type.
     /// </summary>
-    /// <remarks>
-    /// The struct uses sequential layout and a fixed size to ensure consistent memory alignment and layout.
-    /// </remarks>
     [StructLayout(LayoutKind.Sequential, Size = 12 * sizeof(Real))]
     public struct MemBlock12Real { }
 
     /// <summary>
     /// A memory block with a size equivalent to sixteen instances of the <see cref="Real"/> type.
     /// </summary>
-    /// <remarks>
-    /// The struct uses sequential layout and a fixed size to ensure consistent memory alignment and layout.
-    /// </remarks>
     [StructLayout(LayoutKind.Sequential, Size = 16 * sizeof(Real))]
     public struct MemBlock16Real { }
 
@@ -92,9 +90,13 @@ public static unsafe class MemoryHelper
     /// <b>Safety:</b> The caller must free the returned pointer using <see cref="Free{T}"/>.
     /// The memory is not zero-initialized.
     /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when <paramref name="num"/> is negative.</exception>
+    /// <exception cref="OverflowException">Thrown when the requested byte count exceeds the native address space.</exception>
     public static T* AllocateHeap<T>(int num) where T : unmanaged
     {
-        return (T*)AllocateHeap(num * sizeof(T));
+        ArgumentOutOfRangeException.ThrowIfNegative(num);
+        nuint byteCount = checked((nuint)num * (nuint)sizeof(T));
+        return (T*)NativeMemory.Alloc(byteCount);
     }
 
     /// <summary>
@@ -108,9 +110,16 @@ public static unsafe class MemoryHelper
     /// <b>Safety:</b> The caller must free the returned pointer using <see cref="AlignedFree"/>.
     /// The memory is not zero-initialized.
     /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="num"/> is negative or <paramref name="alignment"/> is not a positive power of two.
+    /// </exception>
+    /// <exception cref="OverflowException">Thrown when the requested byte count exceeds the native address space.</exception>
     public static T* AlignedAllocateHeap<T>(int num, int alignment) where T : unmanaged
     {
-        return (T*)AlignedAllocateHeap(num * sizeof(T), alignment);
+        ArgumentOutOfRangeException.ThrowIfNegative(num);
+        ValidateAlignment(alignment);
+        nuint byteCount = checked((nuint)num * (nuint)sizeof(T));
+        return (T*)NativeMemory.AlignedAlloc(byteCount, (nuint)alignment);
     }
 
     /// <summary>
@@ -132,7 +141,12 @@ public static unsafe class MemoryHelper
     /// <b>Safety:</b> The caller must free the returned pointer using <see cref="Free(void*)"/>.
     /// The memory is not zero-initialized.
     /// </remarks>
-    public static void* AllocateHeap(int len) => NativeMemory.Alloc((nuint)len);
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when <paramref name="len"/> is negative.</exception>
+    public static void* AllocateHeap(int len)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(len);
+        return NativeMemory.Alloc((nuint)len);
+    }
 
     /// <summary>
     /// Allocates a block of aligned unmanaged memory of the specified length in bytes.
@@ -144,7 +158,15 @@ public static unsafe class MemoryHelper
     /// <b>Safety:</b> The caller must free the returned pointer using <see cref="AlignedFree"/>.
     /// The memory is not zero-initialized.
     /// </remarks>
-    public static void* AlignedAllocateHeap(int len, int alignment) => NativeMemory.AlignedAlloc((nuint)len, (nuint)alignment);
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="len"/> is negative or <paramref name="alignment"/> is not a positive power of two.
+    /// </exception>
+    public static void* AlignedAllocateHeap(int len, int alignment)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(len);
+        ValidateAlignment(alignment);
+        return NativeMemory.AlignedAlloc((nuint)len, (nuint)alignment);
+    }
 
     /// <summary>
     /// Frees a block of unmanaged memory previously allocated.
@@ -163,5 +185,19 @@ public static unsafe class MemoryHelper
     /// </summary>
     /// <param name="buffer">A pointer to the memory block to zero out.</param>
     /// <param name="len">The length of the memory block to zero out, in bytes.</param>
-    public static void MemSet(void* buffer, int len)  => Unsafe.InitBlock(buffer, 0, (uint)len);
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when <paramref name="len"/> is negative.</exception>
+    public static void MemSet(void* buffer, int len)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(len);
+        Unsafe.InitBlockUnaligned(buffer, 0, (uint)len);
+    }
+
+    private static void ValidateAlignment(int alignment)
+    {
+        if (alignment <= 0 || (alignment & (alignment - 1)) != 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(alignment), alignment,
+                "Alignment must be a positive power of two.");
+        }
+    }
 }

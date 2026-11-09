@@ -10,8 +10,8 @@ public class NullBodyTests
         var world = new World();
 
         Assert.That(world.NullBody.MotionType, Is.EqualTo(MotionType.Static));
-        Assert.That(world.NullBody.Data.InverseMass, Is.EqualTo((Real)0.0).Within((Real)1e-6));
-        Assert.That(world.NullBody.Data.InverseInertiaWorld, Is.EqualTo(JMatrix.Zero));
+        Assert.That(world.NullBody.Data.InverseMassVector, Is.EqualTo(JVector.Zero));
+        Assert.That(world.NullBody.Data.InverseInertiaWorld, Is.EqualTo(JSymmetricMatrix.Zero));
         world.Dispose();
     }
 
@@ -57,5 +57,20 @@ public class NullBodyTests
         Assert.That(body.Contacts, Is.Empty);
         Assert.That(world.NullBody.Shapes, Is.Empty);
         world.Dispose();
+    }
+
+    [Test]
+    public void Clear_DetachesNullBodyShapes()
+    {
+        using var world = new World();
+        var shape = new SphereShape((Real)1.0);
+        world.NullBody.AddShape(shape);
+
+        world.Clear();
+
+        Assert.That(world.NullBody.Shapes, Is.Empty);
+        Assert.That(shape.IsRegistered, Is.False);
+        Assert.That(world.DynamicTree.Proxies, Has.Count.EqualTo(0));
+        Assert.DoesNotThrow(() => world.NullBody.AddShape(shape));
     }
 }

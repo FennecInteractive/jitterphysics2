@@ -28,6 +28,7 @@ public partial class Playground : RenderWindow
     private readonly double[] debugTimes = new double[(int)World.Timings.Last];
     private readonly StringBuilder gcText = new();
     private readonly float[] physicsTime = new float[100];
+    private readonly float[] treeCost = new float[100];
     private readonly HashSet<UiKey> uiPressedKeys = new();
     private readonly HashSet<UiMouseButton> uiDownMouseButtons = new();
     private readonly StringBuilder uiTextInput = new();
@@ -35,12 +36,16 @@ public partial class Playground : RenderWindow
     {
         Position = new System.Numerics.Vector2(16f, 16f),
         Size = new System.Numerics.Vector2(0f, 760f),
-        MaxSize = new System.Numerics.Vector2(260f, 0f)
+        MaxSize = new System.Numerics.Vector2(300f, 0f)
     };
 
     private double totalTime;
     private int samplingRate = 5;
     private int accSteps;
+    private bool treeCostSampleDue;
+    private int treeDepth;
+    private int maximumTreeImbalance;
+    private double treeAreaRatio;
     private double lastTime;
     private ushort frameCount;
     private ushort fps = 100;
@@ -49,8 +54,66 @@ public partial class Playground : RenderWindow
     private bool optionsSectionOpen = true;
     private bool debugDrawSectionOpen;
     private bool broadphaseSectionOpen;
+    private bool treeQualitySectionOpen;
     private bool timingsSectionOpen = true;
     private bool gcSectionOpen = true;
+
+    private void ConfigureGuiTheme()
+    {
+        Gui.Theme = new Theme
+        {
+            PanelBg = new Color(20, 20, 20, 80),
+            PanelBorder = new Color(156, 156, 156, 72),
+            ButtonBg = new Color(68, 68, 68, 120),
+            ButtonBgHover = new Color(92, 92, 92, 152),
+            ButtonBgPressed = new Color(60, 60, 60, 136),
+            ButtonBorder = new Color(148, 148, 148, 72),
+            ButtonBorderHover = new Color(188, 188, 188, 96),
+            ButtonBorderPressed = new Color(140, 140, 140, 84),
+            ToggleBg = new Color(72, 72, 72, 132),
+            ToggleBgHover = new Color(72, 104, 156, 176),
+            ToggleBgPressed = new Color(60, 90, 140, 188),
+            ToggleBgActive = new Color(88, 78, 58, 176),
+            ToggleBorder = new Color(148, 148, 148, 72),
+            ToggleBorderHover = new Color(154, 184, 224, 124),
+            ToggleBorderPressed = new Color(132, 166, 210, 132),
+            ToggleBorderActive = new Color(255, 200, 90, 216),
+            PlotBg = new Color(54, 84, 132, 108),
+            PlotBorder = new Color(136, 170, 222, 132),
+            PlotFill = new Color(255, 186, 52, 240),
+            SliderBg = new Color(40, 48, 60, 188),
+            SliderBgHover = new Color(48, 58, 72, 204),
+            SliderBgActive = new Color(34, 42, 54, 216),
+            SliderFill = new Color(77, 121, 186, 222),
+            SliderFillActive = new Color(96, 145, 216, 234),
+            SliderBorder = new Color(142, 152, 168, 108),
+            Separator = new Color(196, 196, 196, 112),
+            SelectableBg = Color.Transparent,
+            SelectableBgHover = new Color(72, 118, 188, 76),
+            SelectableBgPressed = new Color(72, 118, 188, 112),
+            SelectableBgSelected = new Color(72, 118, 188, 188),
+            SelectableBorder = Color.Transparent,
+            SelectableBorderHover = Color.Transparent,
+            SelectableBorderPressed = Color.Transparent,
+            SelectableBorderSelected = new Color(128, 170, 226, 136),
+            CollapsingHeaderBg = Color.Transparent,
+            CollapsingHeaderBgHover = new Color(72, 118, 188, 64),
+            CollapsingHeaderBgPressed = new Color(72, 118, 188, 96),
+            CollapsingHeaderBgOpen = new Color(20,20,20, 22),
+            CollapsingHeaderPadding = new EdgeInsets(2f, 2f),
+            ScrollbarTrack = new Color(80, 80, 80, 150),
+            ScrollbarThumb = new Color(40, 40, 40, 150),
+            ScrollbarThumbHover = new Color(120, 166, 232, 150),
+            ScrollbarThumbActive = new Color(120, 166, 232, 208),
+            WindowTitleText = new Color(255, 200, 90),
+            TextPrimary = Color.White,
+            TextSecondary = new Color(228, 228, 228),
+            TreeIndent = 0f,
+            UseLcdText = true,
+            SliderBlockWidthFactor = 0.2f,
+            SliderFillText = Color.White
+        };
+    }
 
     private void UpdateDisplayText()
     {
@@ -77,11 +140,47 @@ public partial class Playground : RenderWindow
             physicsTime[i] = physicsTime[i - 1];
 
         physicsTime[0] = (float)totalTime;
+        treeCostSampleDue = true;
 
         gcText.Append("gen0: ").Append(GC.CollectionCount(0))
               .Append("; gen1: ").Append(GC.CollectionCount(1))
               .Append("; gen2: ").AppendLine(GC.CollectionCount(2).ToString());
         gcText.Append("pause total: ").Append(GC.GetTotalPauseDuration().TotalSeconds).AppendLine(" s");
+    }
+
+    private void SampleTreeQuality()
+    {
+        for (int i = treeCost.Length; i-- > 1;)
+            treeCost[i] = treeCost[i - 1];
+
+        DynamicTree tree = World.DynamicTree;
+        double cost = tree.CalculateCost();
+        treeCost[0] = (float)cost;
+        treeDepth = 0;
+        maximumTreeImbalance = 0;
+        treeAreaRatio = 0.0d;
+
+        if (tree.Root != DynamicTree.NullNode)
+        {
+            ReadOnlySpan<DynamicTree.Node> nodes = tree.Nodes;
+            DynamicTree.Node rootNode = nodes[tree.Root];
+            treeDepth = rootNode.Height + 1;
+
+            double rootArea = rootNode.ExpandedBox.GetSurfaceArea();
+            if (rootArea > 0.0d) treeAreaRatio = cost / rootArea;
+
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                DynamicTree.Node node = nodes[i];
+                if (node.Left == DynamicTree.NullNode || node.Right == DynamicTree.NullNode)
+                    continue;
+
+                int imbalance = int.Abs(nodes[node.Left].Height - nodes[node.Right].Height);
+                maximumTreeImbalance = int.Max(maximumTreeImbalance, imbalance);
+            }
+        }
+
+        treeCostSampleDue = false;
     }
 
     private void PrepareCustomOverlayFrame(int logicalWidth, int logicalHeight,
@@ -93,6 +192,7 @@ public partial class Playground : RenderWindow
         var frame = new RenderFrameInfo(logicalWidth, logicalHeight, framebufferWidth, framebufferHeight);
         Gui.BeginFrame(frame, logicalMouse, BuildUiInputState());
         BuildDemoOverlay(Gui);
+        currentDemo?.DrawGui(Gui);
 
         overlayFramePrepared = true;
         WantsCaptureKeyboard = Gui.WantsCaptureKeyboard;
@@ -161,7 +261,7 @@ public partial class Playground : RenderWindow
         for (int i = 0; i < physicsTime.Length; i++)
             maxPhysicsTime = MathF.Max(maxPhysicsTime, physicsTime[i]);
 
-        root.Window("stats", "Jitter2 Demo", statsWindowState, 260f, content =>
+        root.Window("Jitter2 Demo", statsWindowState, 300f, content =>
         {
             content.ItemSpacing(0f);
             content.Label($"{fps} fps", color: content.Theme.WindowTitleText);
@@ -185,8 +285,8 @@ public partial class Playground : RenderWindow
                 for (int i = 0; i < demos.Count; i++)
                 {
                     var demo = demos[i];
-                    var item = popup.MenuItem($"Demo {i:00} - {demo.Name}",
-                        selected: i == selectedDemoIndex, closeOnActivate: true);
+                    var item = popup.MenuItem($"{MaterialSymbols.ViewInAr} Demo {i:00} - {demo.Name}",
+                        selected: i == selectedDemoIndex, closeOnActivate: true, id: i);
                     if (item.Activated)
                         SwitchDemo(i);
 
@@ -194,7 +294,8 @@ public partial class Playground : RenderWindow
                     if (!string.IsNullOrWhiteSpace(tooltip))
                         popup.Tooltip(item, tooltip, maxWidth: 420f);
                 }
-            }, width: content.AvailableWidth, maxPopupHeight: 720f, openOnHover: true, openToSide: true);
+            }, width: content.AvailableWidth, maxPopupHeight: 720f, openOnHover: true, openToSide: true,
+                id: "demo-menu");
             content.Theme.TextPrimary = originalMenuTextColor;
 
             if (!demoMenuHintDismissed && (demoMenu.Hovered || demoMenu.Opened))
@@ -202,11 +303,11 @@ public partial class Playground : RenderWindow
 
             content.Separator();
 
-            content.CollapsingHeader("Objects", ref objectsSectionOpen, width: content.AvailableWidth);
+            content.CollapsingHeader($"{MaterialSymbols.Numbers} Objects", ref objectsSectionOpen, width: content.AvailableWidth);
             if (objectsSectionOpen)
             {
                 World.SpanData data = World.RawData;
-                content.Vertical(labels =>
+                content.Column(labels =>
                 {
                     labels.ItemSpacing(1f);
                     TableRow(labels, "Islands", $"{World.Islands.Count}/{World.Islands.ActiveCount}", 82f);
@@ -218,10 +319,10 @@ public partial class Playground : RenderWindow
                 });
             }
 
-            content.CollapsingHeader("Options", ref optionsSectionOpen, width: content.AvailableWidth);
+            content.CollapsingHeader($"{MaterialSymbols.Tune} Options", ref optionsSectionOpen, width: content.AvailableWidth);
             if (optionsSectionOpen)
             {
-                content.Vertical(options =>
+                content.Column(options =>
                 {
                     options.ItemSpacing(4f);
 
@@ -230,29 +331,49 @@ public partial class Playground : RenderWindow
                         World.AllowDeactivation = allowDeactivation;
 
                     bool auxiliaryContacts = World.EnableAuxiliaryContactPoints;
-                    if (options.Checkbox("Auxiliary Flat Surface", ref auxiliaryContacts).Changed)
+                    if (options.Checkbox("Auxiliary Contact Points", ref auxiliaryContacts).Changed)
                         World.EnableAuxiliaryContactPoints = auxiliaryContacts;
 
                     options.Checkbox("Multithreading", ref multiThread);
                 });
             }
 
-            content.CollapsingHeader("Debug Draw", ref debugDrawSectionOpen, width: content.AvailableWidth);
+            content.CollapsingHeader($"{MaterialSymbols.Shapes} Debug Draw", ref debugDrawSectionOpen, width: content.AvailableWidth);
             if (debugDrawSectionOpen)
             {
-                content.Vertical(debugDraw =>
+                content.Column(debugDraw =>
                 {
                     debugDraw.ItemSpacing(4f);
-                    debugDraw.Checkbox("Islands", ref debugDrawIslands);
-                    debugDraw.Checkbox("Contacts", ref debugDrawContacts);
-                    debugDraw.Checkbox("Shapes", ref debugDrawShapes);
+                    debugDraw.Row(columns =>
+                    {
+                        const float columnGap = 8f;
+                        columns.ItemSpacing(columnGap);
+                        float columnWidth = (columns.AvailableWidth - columnGap) / 2f;
+                        columns.FixedWidth(columnWidth, left =>
+                        {
+                            left.ItemSpacing(4f);
+                            left.Checkbox("Island Bounds", ref debugDrawIslands);
+                            left.Checkbox("Shape Bounds", ref debugDrawShapeBounds);
+                            left.Checkbox("Contacts", ref debugDrawContacts);
+                        });
+                        columns.FixedWidth(columnWidth, right =>
+                        {
+                            right.ItemSpacing(4f);
+                            right.Checkbox("Bodies", ref debugDrawBodies);
+                            right.Checkbox("Constraints", ref debugDrawConstraints);
+                        });
+                    });
+                    if (debugDrawConstraints)
+                        debugDraw.Slider("Constraint size", ref debugDrawConstraintSize, 0.05f, 2f,
+                            debugDraw.AvailableWidth);
                 });
             }
 
-            content.CollapsingHeader("Broadphase", ref broadphaseSectionOpen, width: content.AvailableWidth);
+            bool broadphaseWasOpen = broadphaseSectionOpen;
+            content.CollapsingHeader($"{MaterialSymbols.AccountTree} Broadphase", ref broadphaseSectionOpen, width: content.AvailableWidth);
             if (broadphaseSectionOpen)
             {
-                content.Vertical(labels =>
+                content.Column(labels =>
                 {
                     labels.ItemSpacing(0f);
                     TableRow(labels, "PairHashSet Size", World.DynamicTree.HashSetInfo.TotalSize.ToString(), 72f);
@@ -262,24 +383,51 @@ public partial class Playground : RenderWindow
                     for (int i = 0; i < (int)DynamicTree.Timings.Last; i++)
                         TableRow(labels, ((DynamicTree.Timings)i).ToString(), $"{World.DynamicTree.DebugTimings[i]:N2}", 72f);
                 });
-                
+
                 content.Spacing(4f);
-                content.Vertical(controls =>
+                content.Column(controls =>
                 {
                     controls.ItemSpacing(4f);
                     controls.Checkbox("Debug draw tree", ref debugDrawTree);
 
-                    if (controls.SliderInt("tree-depth", ref debugDrawTreeDepth, 1, 64, controls.AvailableWidth,
-                        label: "tree depth").Changed)
+                    if (controls.SliderInt("tree depth", ref debugDrawTreeDepth, 1, 64, controls.AvailableWidth,
+                        id: "tree-depth").Changed)
                         debugDrawTree = true;
                 });
+
+                content.Spacing(4f);
+                bool treeQualityWasOpen = treeQualitySectionOpen;
+                content.CollapsingHeader($"{MaterialSymbols.QueryStats} Tree quality", ref treeQualitySectionOpen,
+                    width: content.AvailableWidth, id: "tree-quality");
+                if (treeQualitySectionOpen)
+                {
+                    if (treeCostSampleDue || !broadphaseWasOpen || !treeQualityWasOpen)
+                        SampleTreeQuality();
+
+                    content.Column(labels =>
+                    {
+                        labels.ItemSpacing(0f);
+                        TableRow(labels, "Tree Depth", treeDepth.ToString(), 72f);
+                        TableRow(labels, "Max Imbalance", maximumTreeImbalance.ToString(), 72f);
+                        TableRow(labels, "Area Ratio", $"{treeAreaRatio:N2}", 72f);
+                    });
+
+                    float maxTreeCost = 0f;
+                    for (int i = 0; i < treeCost.Length; i++)
+                        maxTreeCost = MathF.Max(maxTreeCost, treeCost[i]);
+
+                    content.Spacing(4f);
+                    content.Histogram(treeCost, content.AvailableWidth, 80f,
+                        $"SAH current {treeCost[0] / 1000f:N0}k; max {maxTreeCost / 1000f:N0}k",
+                        scaleMin: 0f);
+                }
                 
             }
 
-            content.CollapsingHeader("Timings", ref timingsSectionOpen, width: content.AvailableWidth);
+            content.CollapsingHeader($"{MaterialSymbols.AvgTime} Timings", ref timingsSectionOpen, width: content.AvailableWidth);
             if (timingsSectionOpen)
             {
-                content.Vertical(labels =>
+                content.Column(labels =>
                 {
                     labels.ItemSpacing(0f);
 
@@ -291,7 +439,7 @@ public partial class Playground : RenderWindow
 
                 content.Histogram(physicsTime, content.AvailableWidth, 80f,
                     $"max. {maxPhysicsTime:0.00} ms", scaleMin: 0f);
-                content.Vertical(labels =>
+                content.Column(labels =>
                 {
                     labels.ItemSpacing(0f);
                     labels.Label($"Total: {totalTime:0.00}ms ({(totalTime > 0 ? 1000.0d / totalTime : 0d):0} fps)",
@@ -301,16 +449,16 @@ public partial class Playground : RenderWindow
                 
                 content.Spacing(4f);
                 
-                content.SliderInt("sample-rate", ref samplingRate, 1, 10, content.AvailableWidth,
-                    label: "sampling rate");
+                content.SliderInt("sampling rate", ref samplingRate, 1, 10, content.AvailableWidth,
+                    id: "sample-rate");
             }
 
-            content.CollapsingHeader("GC statistics", ref gcSectionOpen, width: content.AvailableWidth);
+            content.CollapsingHeader($"{MaterialSymbols.Memory} GC statistics", ref gcSectionOpen, width: content.AvailableWidth);
             if (gcSectionOpen)
             {
                 content.Label(gcText.ToString(), maxWidth: content.AvailableWidth, wrap: TextWrapMode.WordWrap);
             }
-        }, resizable: true, closable: false, header: false);
+        }, resizable: true, closable: false, header: false, id: "stats");
     }
 
     private string BuildDemoTooltip(IDemo demo)
@@ -330,7 +478,7 @@ public partial class Playground : RenderWindow
     private string BuildDemoMenuLabel()
     {
         if (selectedDemoIndex < 0 || selectedDemoIndex >= demos.Count)
-            return "Select Demo Scene";
+            return $"Select Demo Scene";
 
         const int maxNameLength = 18;
         string name = demos[selectedDemoIndex].Name;
@@ -344,30 +492,30 @@ public partial class Playground : RenderWindow
     {
         const float columnGap = 8f;
 
-        ui.Horizontal(row =>
+        using (ui.Row())
         {
-            row.ItemSpacing(columnGap);
+            ui.ItemSpacing(columnGap);
 
-            float rowWidth = row.AvailableWidth;
+            float rowWidth = ui.AvailableWidth;
             float resolvedValueWidth = MathF.Min(valueWidth, MathF.Max(0f, rowWidth));
             float labelWidth = MathF.Max(0f, rowWidth - resolvedValueWidth - columnGap);
 
-            row.Width(labelWidth, left =>
+            using (ui.FixedWidth(labelWidth))
             {
-                left.Label(label,
-                    maxWidth: left.AvailableWidth,
+                ui.Label(label,
+                    maxWidth: ui.AvailableWidth,
                     overflow: TextOverflowMode.Ellipsis);
-            });
+            }
 
-            row.Width(resolvedValueWidth, right =>
+            using (ui.FixedWidth(resolvedValueWidth))
             {
-                right.Label(value,
-                    color: right.Theme.TextSecondary,
-                    maxWidth: right.AvailableWidth,
+                ui.Label(value,
+                    color: ui.Theme.TextSecondary,
+                    maxWidth: ui.AvailableWidth,
                     overflow: TextOverflowMode.Ellipsis,
-                    width: right.AvailableWidth,
+                    width: ui.AvailableWidth,
                     align: UiAlign.End);
-            });
-        });
+            }
+        }
     }
 }

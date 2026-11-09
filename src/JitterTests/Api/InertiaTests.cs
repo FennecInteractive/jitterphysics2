@@ -3,11 +3,11 @@ namespace JitterTests.Api;
 [TestFixture]
 public class InertiaTests
 {
-    private static void Check(RigidBodyShape shape, JMatrix inertia, JVector com, Real mass)
+    private static void Check(RigidBodyShape shape, JSymmetricMatrix inertia, JVector com, Real mass)
     {
-        shape.CalculateMassInertia(out JMatrix shapeInertia, out JVector shapeCom, out Real shapeMass);
+        shape.CalculateMassInertia(out JSymmetricMatrix shapeInertia, out JVector shapeCom, out Real shapeMass);
 
-        JMatrix dInertia = shapeInertia - inertia;
+        JMatrix dInertia = (shapeInertia - inertia).ToMatrix();
         Assert.That(MathHelper.IsZero(dInertia.UnsafeGet(0), (Real)1e-3));
         Assert.That(MathHelper.IsZero(dInertia.UnsafeGet(1), (Real)1e-3));
         Assert.That(MathHelper.IsZero(dInertia.UnsafeGet(2), (Real)1e-3));
@@ -23,7 +23,7 @@ public class InertiaTests
     public static void CapsuleInertia()
     {
         var ts = new CapsuleShape((Real)0.429, (Real)1.7237);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
     }
 
@@ -31,7 +31,7 @@ public class InertiaTests
     public static void CylinderInertia()
     {
         var ts = new CylinderShape((Real)0.429, (Real)1.7237);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
     }
 
@@ -39,7 +39,7 @@ public class InertiaTests
     public static void ConeInertia()
     {
         var ts = new ConeShape((Real)0.429, (Real)1.7237);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
     }
 
@@ -47,7 +47,7 @@ public class InertiaTests
     public static void BoxInertia()
     {
         var ts = new BoxShape((Real)0.429, (Real)1.7237, (Real)2.11383);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
     }
 
@@ -55,7 +55,7 @@ public class InertiaTests
     public static void SphereInertia()
     {
         var ts = new SphereShape((Real)0.429);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
     }
 
@@ -66,8 +66,21 @@ public class InertiaTests
         var translation = new JVector((Real)2.847, (Real)3.432, (Real)1.234);
 
         var ts = new TransformedShape(ss, translation);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
+    }
+
+    [TestCase]
+    public static void NestedTransformedInertia_MatchesAnalyticalBox()
+    {
+        var box = new BoxShape(1);
+        var first = new TransformedShape(box, new JVector(1, 0, 0));
+        var second = new TransformedShape(first, new JVector(1, 0, 0));
+
+        // A unit box centered at x = 2 has Ixx = 1/6 and Iyy = Izz = 1/6 + 4.
+        JSymmetricMatrix expected = new((Real)(1.0 / 6.0), 0, 0,
+            (Real)(25.0 / 6.0), 0, (Real)(25.0 / 6.0));
+        Check(second, expected, new JVector(2, 0, 0), 1);
     }
 
     [TestCase]
@@ -77,7 +90,7 @@ public class InertiaTests
         var rotation = JMatrix.CreateRotationX((Real)0.7) * JMatrix.CreateRotationY((Real)1.1);
 
         var ts = new TransformedShape(box, rotation);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
     }
 
@@ -89,7 +102,7 @@ public class InertiaTests
         var rotation = JMatrix.CreateRotationZ((Real)0.5) * JMatrix.CreateRotationX((Real)1.3);
 
         var ts = new TransformedShape(box, translation, rotation);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
     }
 
@@ -101,7 +114,7 @@ public class InertiaTests
         var translation = new JVector((Real)1.0, (Real)2.0, (Real)3.0);
 
         var ts = new TransformedShape(box, translation, scale);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
     }
 
@@ -115,7 +128,7 @@ public class InertiaTests
         var translation = new JVector((Real)1.5, (Real)(-0.7), (Real)2.3);
 
         var ts = new TransformedShape(box, translation, shear);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
     }
 
@@ -135,7 +148,27 @@ public class InertiaTests
         cvh.Add(new JTriangle(a, c, d));
 
         var ts = new ConvexHullShape(cvh);
-        ShapeHelper.CalculateMassInertia(ts, out JMatrix inertia, out JVector com, out Real mass, 8);
+        ShapeHelper.CalculateMassInertia(ts, out JSymmetricMatrix inertia, out JVector com, out Real mass, 8);
         Check(ts, inertia, com, mass);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public static void TransformedInertia_MatchesAnalyticalShearedBox(bool reflected)
+    {
+        // The box has mass 48 and second moments diag(16, 64, 144).
+        // Shearing produces all three independent off-diagonal inertia components after translation.
+        var box = new BoxShape(2, 4, 6);
+        JMatrix transform = new(1, (Real)0.5, 0, 0, 1, 0, (Real)0.25, 0, 1);
+        if (reflected)
+        {
+            transform.M11 = -transform.M11;
+            transform.M12 = -transform.M12;
+        }
+
+        JVector translation = new(1, -2, 3);
+        var shape = new TransformedShape(box, translation, transform);
+        JSymmetricMatrix expected = new(833, reflected ? 128 : 64, reflected ? -140 : -148, 657, 288, 336);
+        Check(shape, expected, translation, 48);
     }
 }

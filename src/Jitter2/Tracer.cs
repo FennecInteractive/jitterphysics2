@@ -60,6 +60,7 @@ internal enum TraceName : long
     Queue,
     PreStep,
     PostStep,
+    OptimizeBroadPhase,
 }
 
 internal enum TracePhase : byte
@@ -88,7 +89,7 @@ public static class Tracer
         string message =
             $">>> PROFILING ENABLED! <<< Use {nameof(Tracer)}.{nameof(WriteToFile)} to dump trace to disk.";
 
-        if(Logger.Listener == null) Console.WriteLine(message);
+        if (Logger.Listener == null) Console.WriteLine(message);
         else Logger.Warning(message);
 
         StartGcTracing();

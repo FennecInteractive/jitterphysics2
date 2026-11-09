@@ -8,18 +8,28 @@
 
 using System.Runtime.CompilerServices;
 using Jitter2.Collision.Shapes;
+using Jitter2.Dynamics;
 using Jitter2.LinearMath;
 
 namespace Jitter2.Collision;
 
 /// <summary>
-/// Filters internal edge collisions for <see cref="TriangleShape"/> geometry. Adjusts collision
-/// normals at shared edges to match neighboring triangles, or discards the collision if the normal
-/// cannot be resolved. Requires triangle adjacency information; boundary edges (no neighbor)
-/// are left unmodified. Back-face collisions are discarded.
+/// Reduces snagging on shared edges of <see cref="TriangleShape"/> meshes.
 /// </summary>
+/// <remarks>
+/// Adjusts or discards contacts near shared edges using the mesh's neighboring triangles.
+/// Boundary edges are left unchanged. Contacts directed into the back face within
+/// <see cref="AngleThreshold"/> of the reversed triangle normal are discarded.
+/// </remarks>
 public class TriangleEdgeCollisionFilter : INarrowPhaseFilter
 {
+    private enum EdgeContactEvaluation
+    {
+        Keep,
+        Discard,
+        Edge
+    }
+
     /// <summary>
     /// Gets or sets the distance threshold for edge collision detection, in world units.
     /// </summary>
@@ -31,6 +41,12 @@ public class TriangleEdgeCollisionFilter : INarrowPhaseFilter
     public Real EdgeThreshold { get; set; } = (Real)0.01;
 
     private Real cosAngle = (Real)0.999;
+
+    /// <summary>
+    /// Gets or sets whether dynamic triangle bodies receive edge filtering. Static and kinematic
+    /// triangle geometry is always filtered. Defaults to <see langword="false"/>.
+    /// </summary>
+    public bool FilterDynamicBodies { get; set; }
 
     /// <summary>
     /// Gets or sets the minimum length of the projected collision normal required to keep the contact.
@@ -45,9 +61,8 @@ public class TriangleEdgeCollisionFilter : INarrowPhaseFilter
     public Real ProjectionThreshold { get; set; } = (Real)0.5;
 
     /// <summary>
-    /// Gets or sets the angle threshold used for two purposes: determining when two triangle normals
-    /// are considered coplanar (using simpler snapping logic), and discarding back-face collisions
-    /// whose normal is anti-parallel to the triangle normal within this angle.
+    /// Gets or sets the angle tolerance for treating neighboring triangles as coplanar
+    /// and for rejecting contacts directed into a triangle's back face.
     /// </summary>
     /// <value>The default value is approximately 2.5 degrees.</value>
     public JAngle AngleThreshold
@@ -69,6 +84,65 @@ public class TriangleEdgeCollisionFilter : INarrowPhaseFilter
         point -= distance * normal;
     }
 
+    private EdgeContactEvaluation EvaluateTriangleContact(TriangleShape triangleShape, bool triangleIsShapeB,
+        in JVector contactPoint, in JVector normal, out JVector triangleNormal, out JVector neighborNormal)
+    {
+        ref readonly var triangle = ref triangleShape.Mesh.Indices[triangleShape.Index];
+
+        triangleNormal = triangle.Normal;
+        triangleNormal = JVector.Transform(triangleNormal, triangleShape.RigidBody.Data.Orientation);
+        neighborNormal = default;
+
+        if (triangleIsShapeB) JVector.NegateInPlace(ref triangleNormal);
+
+        // Make triangles penetrable from one side.
+        if (JVector.Dot(normal, triangleNormal) < -cosAngle) return EdgeContactEvaluation.Discard;
+
+        triangleShape.GetWorldVertices(out JVector a, out JVector b, out JVector c);
+
+        JVector projectedContactPoint = contactPoint;
+        ProjectPointOnPlane(ref projectedContactPoint, a, b, c);
+
+        var n = b - a;
+        var pma = projectedContactPoint - a;
+        var d0 = (pma - JVector.Dot(pma, n) * n * ((Real)1.0 / n.LengthSquared())).LengthSquared();
+
+        n = c - a;
+        pma = projectedContactPoint - a;
+        var d1 = (pma - JVector.Dot(pma, n) * n * ((Real)1.0 / n.LengthSquared())).LengthSquared();
+
+        n = c - b;
+        pma = projectedContactPoint - b;
+        var d2 = (pma - JVector.Dot(pma, n) * n * ((Real)1.0 / n.LengthSquared())).LengthSquared();
+
+        if (MathR.Min(MathR.Min(d0, d1), d2) > EdgeThreshold * EdgeThreshold)
+        {
+            return EdgeContactEvaluation.Keep;
+        }
+
+        if (d0 < d1 && d0 < d2)
+        {
+            if (triangle.NeighborC == -1) return EdgeContactEvaluation.Keep;
+            neighborNormal = triangleShape.Mesh.Indices[triangle.NeighborC].Normal;
+        }
+        else if (d1 < d2)
+        {
+            if (triangle.NeighborB == -1) return EdgeContactEvaluation.Keep;
+            neighborNormal = triangleShape.Mesh.Indices[triangle.NeighborB].Normal;
+        }
+        else
+        {
+            if (triangle.NeighborA == -1) return EdgeContactEvaluation.Keep;
+            neighborNormal = triangleShape.Mesh.Indices[triangle.NeighborA].Normal;
+        }
+
+        neighborNormal = JVector.Transform(neighborNormal, triangleShape.RigidBody.Data.Orientation);
+
+        if (triangleIsShapeB) JVector.NegateInPlace(ref neighborNormal);
+
+        return EdgeContactEvaluation.Edge;
+    }
+
     /// <inheritdoc />
     public bool Filter(RigidBodyShape shapeA, RigidBodyShape shapeB,
         ref JVector pointA, ref JVector pointB, ref JVector normal, ref Real penetration)
@@ -84,76 +158,31 @@ public class TriangleEdgeCollisionFilter : INarrowPhaseFilter
 
         TriangleShape triangleShape;
 
-        JVector collP;
-
         if (c1)
         {
             triangleShape = ts1!;
-            collP = pointA;
         }
         else
         {
             triangleShape = ts2!;
-            collP = pointB;
         }
 
-        ref readonly var triangle = ref triangleShape.Mesh.Indices[triangleShape.Index];
+        if (triangleShape.RigidBody.MotionType == MotionType.Dynamic && !FilterDynamicBodies) return true;
 
-        JVector tnormal = triangle.Normal;
-        tnormal = JVector.Transform(tnormal, triangleShape.RigidBody.Data.Orientation);
+        EdgeContactEvaluation evaluation = EvaluateTriangleContact(triangleShape, c2,
+            c1 ? pointA : pointB, normal, out JVector triangleNormal, out JVector neighborNormal);
 
-        if (c2) JVector.NegateInPlace(ref tnormal);
-
-        // Make triangles penetrable from one side
-        if (JVector.Dot(normal, tnormal) < -cosAngle) return false;
-
-        triangleShape.GetWorldVertices(out JVector a, out JVector b, out JVector c);
-
-        // project collP onto triangle plane
-        ProjectPointOnPlane(ref collP, a, b, c);
-
-        var n = b - a;
-        var pma = collP - a;
-        var d0 = (pma - JVector.Dot(pma, n) * n * ((Real)1.0 / n.LengthSquared())).LengthSquared();
-
-        n = c - a;
-        pma = collP - a;
-        var d1 = (pma - JVector.Dot(pma, n) * n * ((Real)1.0 / n.LengthSquared())).LengthSquared();
-
-        n = c - b;
-        pma = collP - b;
-        var d2 = (pma - JVector.Dot(pma, n) * n * ((Real)1.0 / n.LengthSquared())).LengthSquared();
-
-        if (MathR.Min(MathR.Min(d0, d1), d2) > EdgeThreshold * EdgeThreshold) return true;
-
-        JVector nnormal;
-
-        if (d0 < d1 && d0 < d2)
-        {
-            if (triangle.NeighborC == -1) return true;
-            nnormal = triangleShape.Mesh.Indices[triangle.NeighborC].Normal;
-        }
-        else if (d1 < d2)
-        {
-            if (triangle.NeighborB == -1) return true;
-            nnormal = triangleShape.Mesh.Indices[triangle.NeighborB].Normal;
-        }
-        else
-        {
-            if (triangle.NeighborA == -1) return true;
-            nnormal = triangleShape.Mesh.Indices[triangle.NeighborA].Normal;
-        }
-
-        nnormal = JVector.Transform(nnormal, triangleShape.RigidBody.Data.Orientation);
+        if (evaluation == EdgeContactEvaluation.Discard) return false;
+        if (evaluation == EdgeContactEvaluation.Keep) return true;
 
         ref var b1Data = ref shapeA.RigidBody.Data;
         ref var b2Data = ref shapeB.RigidBody.Data;
 
-        bool isSpeculative = penetration < (Real)0.0;
+        bool isSeparated = penetration < (Real)0.0;
 
-        if (!isSpeculative)
+        if (!isSeparated)
         {
-            // Check collision again (for non-speculative contacts),
+            // Check collision again (for overlapping contacts),
             // but with zero epa threshold parameter. This is necessary since
             // MPR is not exact for flat shapes, like triangles.
 
@@ -165,66 +194,70 @@ public class TriangleEdgeCollisionFilter : INarrowPhaseFilter
 
             if (!result)
             {
-                // this should not happen
+                // MPR refinement failed; reject the contact.
                 return false;
             }
-        }
 
-        if (c2) JVector.NegateInPlace(ref nnormal);
+            evaluation = EvaluateTriangleContact(triangleShape, c2,
+                c1 ? pointA : pointB, normal, out triangleNormal, out neighborNormal);
+
+            if (evaluation == EdgeContactEvaluation.Discard) return false;
+            if (evaluation == EdgeContactEvaluation.Keep) return true;
+        }
 
         JVector midPoint = (Real)0.5 * (pointA + pointB);
 
-        // now the fun part
+        // Now the fun part.
         //
         // we have a collision close to an edge, with
         //
-        // tnormal -> the triangle normal where collision occurred
-        // nnormal -> the normal of neighboring triangle
-        // normal  -> the collision normal
-        if (JVector.Dot(tnormal, nnormal) > cosAngle)
+        // triangleNormal -> the triangle normal where collision occurred
+        // neighborNormal -> the normal of the neighboring triangle
+        // normal         -> the collision normal
+        if (JVector.Dot(triangleNormal, neighborNormal) > cosAngle)
         {
-            // tnormal and nnormal are the same
-            // --------------------------------
-            Real f5 = JVector.Dot(normal, nnormal);
-            Real f6 = JVector.Dot(normal, tnormal);
+            // triangleNormal and neighborNormal are the same
+            // ----------------------------------------------
+            Real f5 = JVector.Dot(normal, neighborNormal);
+            Real f6 = JVector.Dot(normal, triangleNormal);
 
             if (f5 > f6)
             {
 #if DEBUG_EDGEFILTER
-                Console.WriteLine($"case #1: adjusting; normal {normal} -> {nnormal}");
+                Console.WriteLine($"case #1: adjusting; normal {normal} -> {neighborNormal}");
 #endif
 
-                if (!isSpeculative)
+                if (!isSeparated)
                 {
                     penetration = 0;
                     pointA = pointB = midPoint;
                 }
 
-                normal = nnormal;
+                normal = neighborNormal;
             }
             else
             {
 #if DEBUG_EDGEFILTER
-                Console.WriteLine($"case #1: adjusting; normal {normal} -> {tnormal}");
+                Console.WriteLine($"case #1: adjusting; normal {normal} -> {triangleNormal}");
 #endif
 
-                if (!isSpeculative)
+                if (!isSeparated)
                 {
                     penetration = 0;
                     pointA = pointB = midPoint;
                 }
 
-                normal = tnormal;
+                normal = triangleNormal;
             }
 
             return true;
         }
-        // nnormal and tnormal are different
-        // ----------------------------------
+        // neighborNormal and triangleNormal are different
+        // -----------------------------------------------
 
-        // 1st step, project the normal onto the plane given by tnormal and nnormal
+        // 1st step, project the normal onto the plane given by triangleNormal and neighborNormal
         // by removing the component along the cross product axis
-        JVector cross = nnormal % tnormal;
+        JVector cross = neighborNormal % triangleNormal;
         Real crossLenSq = cross.LengthSquared();
         JVector proj = normal - (cross * normal / crossLenSq) * cross;
 
@@ -234,56 +267,56 @@ public class TriangleEdgeCollisionFilter : INarrowPhaseFilter
             Console.WriteLine($"case #3: discarding");
 
 #endif
-            // can not project onto the plane, discard
+            // Cannot project onto the plane, discard.
             return false;
         }
 
-        // 2nd step, determine if "proj" is between nnormal and tnormal
+        // 2nd step, determine if "proj" is between neighborNormal and triangleNormal
         //
-        //    /    nnormal
+        //    /    neighborNormal
         //   /
         //  /
         //  -----  proj
         // \
         //  \
-        //   \     tnormal
-        Real f1 = proj % nnormal * cross;
-        Real f2 = proj % tnormal * cross;
+        //   \     triangleNormal
+        Real f1 = proj % neighborNormal * cross;
+        Real f2 = proj % triangleNormal * cross;
 
         bool between = f1 <= (Real)0.0 && f2 >= (Real)0.0;
 
         if (!between)
         {
             // not in-between, snap normal
-            Real f3 = JVector.Dot(normal, nnormal);
-            Real f4 = JVector.Dot(normal, tnormal);
+            Real f3 = JVector.Dot(normal, neighborNormal);
+            Real f4 = JVector.Dot(normal, triangleNormal);
 
             if (f3 > f4)
             {
 #if DEBUG_EDGEFILTER
-                Console.WriteLine($"case #2: adjusting; normal {normal} -> {nnormal}");
+                Console.WriteLine($"case #2: adjusting; normal {normal} -> {neighborNormal}");
 
 #endif
-                if (!isSpeculative)
+                if (!isSeparated)
                 {
                     penetration = 0;
                     pointA = pointB = midPoint;
                 }
 
-                normal = nnormal;
+                normal = neighborNormal;
             }
             else
             {
 #if DEBUG_EDGEFILTER
-                Console.WriteLine($"case #2: adjusting; normal {normal} -> {tnormal}");
+                Console.WriteLine($"case #2: adjusting; normal {normal} -> {triangleNormal}");
 #endif
-                if (!isSpeculative)
+                if (!isSeparated)
                 {
                     penetration = 0;
                     pointA = pointB = midPoint;
                 }
 
-                normal = tnormal;
+                normal = triangleNormal;
             }
         }
 

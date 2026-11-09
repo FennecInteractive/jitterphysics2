@@ -13,12 +13,14 @@ using Jitter2.Unmanaged;
 namespace Jitter2.Dynamics.Constraints;
 
 /// <summary>
-/// Constrains a fixed point in the reference frame of one body to a line that is fixed in
-/// the reference frame of another body. This constraint removes two degrees of translational
-/// freedom; three if the limit is enforced.
+/// Keeps an anchor on body 2 on a line attached to body 1, with optional limits along the line.
+/// Relative rotation remains free.
 /// </summary>
 public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
 {
+    /// <inheritdoc />
+    public override string ToString() => FormatDescription(nameof(PointOnLine));
+
     [StructLayout(LayoutKind.Sequential)]
     public struct PointOnLineData
     {
@@ -40,6 +42,9 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
         public Real LimitSoftness;
 
         public JMatrix EffectiveMass;
+        public JVector BilateralMass;
+        public Real CouplingX;
+        public Real CouplingY;
         public JVector AccumulatedImpulse;
         public JVector Bias;
 
@@ -48,7 +53,6 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
 
         public ushort Clamp;
 
-        // public MemBlock96 J0;
     }
 
     private static readonly uint RegisteredDispatchId =
@@ -77,13 +81,24 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
     /// <param name="anchor2">Anchor point on body 2 constrained to the line in world space.</param>
     /// <param name="limit">Distance limit along the axis.</param>
     /// <remarks>
-    /// Computes local anchor points and axis from the current body poses.
+    /// Equal or reversed distance limits fix the point at their midpoint.
     /// Default values: <see cref="Bias"/> = <see cref="Constraint.DefaultLinearBias"/>, <see cref="Softness"/> = <see cref="Constraint.DefaultLinearSoftness"/>,
     /// <see cref="LimitSoftness"/> = <see cref="Constraint.DefaultLinearLimitSoftness"/>, <see cref="LimitBias"/> = <see cref="Constraint.DefaultLinearLimitBias"/>.
     /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="axis"/> is zero or contains a non-finite value, when
+    /// <paramref name="anchor1"/> or <paramref name="anchor2"/> contains a non-finite value,
+    /// or when either value in <paramref name="limit"/> is NaN.
+    /// </exception>
     public void Initialize(JVector axis, JVector anchor1, JVector anchor2, LinearLimit limit)
     {
         VerifyNotZero();
+        ArgumentCheck.NonZero(axis, nameof(axis));
+        ArgumentCheck.Finite(anchor1, nameof(anchor1));
+        ArgumentCheck.Finite(anchor2, nameof(anchor2));
+        ArgumentCheck.NotNaN(limit.From, nameof(limit.From));
+        ArgumentCheck.NotNaN(limit.To, nameof(limit.To));
+
         ref PointOnLineData data = ref Data;
         ref RigidBodyData body1 = ref data.Body1.Data;
         ref RigidBodyData body2 = ref data.Body2.Data;
@@ -132,7 +147,7 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
     }
 
     [SkipLocalsInit]
-    public static void PrepareForIterationPointOnLine(ref ConstraintData constraint, Real idt)
+    public static void PrepareForIterationPointOnLine(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, PointOnLineData>(ref constraint);
         ref RigidBodyData body1 = ref data.Body1.Data;
@@ -176,11 +191,13 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
 
         data.EffectiveMass = JMatrix.Identity;
 
-        data.EffectiveMass.M11 = body1.InverseMass + body2.InverseMass +
+        data.EffectiveMass.M11 = JVector.Multiply(jacobian[0], body1.InverseMassVector) * jacobian[0] +
+                                 JVector.Multiply(jacobian[2], body2.InverseMassVector) * jacobian[2] +
                                  JVector.Transform(jacobian[1], body1.InverseInertiaWorld) * jacobian[1] +
                                  JVector.Transform(jacobian[3], body2.InverseInertiaWorld) * jacobian[3];
 
-        data.EffectiveMass.M22 = body1.InverseMass + body2.InverseMass +
+        data.EffectiveMass.M22 = JVector.Multiply(jacobian[4], body1.InverseMassVector) * jacobian[4] +
+                                 JVector.Multiply(jacobian[6], body2.InverseMassVector) * jacobian[6] +
                                  JVector.Transform(jacobian[5], body1.InverseInertiaWorld) * jacobian[5] +
                                  JVector.Transform(jacobian[7], body2.InverseInertiaWorld) * jacobian[7];
 
@@ -190,12 +207,22 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
         data.EffectiveMass.M21 = JVector.Transform(jacobian[5], body1.InverseInertiaWorld) * jacobian[1] +
                                  JVector.Transform(jacobian[7], body2.InverseInertiaWorld) * jacobian[3];
 
-        if (error.Z > data.Max)
+        Real coupling12 = JVector.Multiply(jacobian[0], body1.InverseMassVector) * jacobian[4] +
+                          JVector.Multiply(jacobian[2], body2.InverseMassVector) * jacobian[6];
+        data.EffectiveMass.M12 += coupling12;
+        data.EffectiveMass.M21 += coupling12;
+
+        if (data.Min >= data.Max)
+        {
+            error.Z -= (Real)0.5 * data.Min + (Real)0.5 * data.Max;
+            data.Clamp = 3;
+        }
+        else if (error.Z >= data.Max)
         {
             error.Z -= data.Max;
             data.Clamp = 1;
         }
-        else if (error.Z < data.Min)
+        else if (error.Z <= data.Min)
         {
             error.Z -= data.Min;
             data.Clamp = 2;
@@ -207,7 +234,8 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
 
         if (data.Clamp != 0)
         {
-            data.EffectiveMass.M33 = body1.InverseMass + body2.InverseMass +
+            data.EffectiveMass.M33 = JVector.Multiply(jacobian[8], body1.InverseMassVector) * jacobian[8] +
+                                     JVector.Multiply(jacobian[10], body2.InverseMassVector) * jacobian[10] +
                                      JVector.Transform(jacobian[9], body1.InverseInertiaWorld) * jacobian[9] +
                                      JVector.Transform(jacobian[11], body2.InverseInertiaWorld) * jacobian[11];
 
@@ -222,26 +250,54 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
 
             data.EffectiveMass.M32 = JVector.Transform(jacobian[9], body1.InverseInertiaWorld) * jacobian[5] +
                                      JVector.Transform(jacobian[11], body2.InverseInertiaWorld) * jacobian[7];
+
+            Real coupling13 = JVector.Multiply(jacobian[0], body1.InverseMassVector) * jacobian[8] +
+                              JVector.Multiply(jacobian[2], body2.InverseMassVector) * jacobian[10];
+            Real coupling23 = JVector.Multiply(jacobian[4], body1.InverseMassVector) * jacobian[8] +
+                              JVector.Multiply(jacobian[6], body2.InverseMassVector) * jacobian[10];
+            data.EffectiveMass.M13 += coupling13;
+            data.EffectiveMass.M31 += coupling13;
+            data.EffectiveMass.M23 += coupling23;
+            data.EffectiveMass.M32 += coupling23;
         }
 
-        data.EffectiveMass.M11 += data.Softness * idt;
-        data.EffectiveMass.M22 += data.Softness * idt;
-        data.EffectiveMass.M33 += data.LimitSoftness * idt;
+        data.EffectiveMass.M11 += data.Softness * timeStep.InverseSubstepDt;
+        data.EffectiveMass.M22 += data.Softness * timeStep.InverseSubstepDt;
+        data.EffectiveMass.M33 += data.LimitSoftness * timeStep.InverseSubstepDt;
 
-        JMatrix.Inverse(data.EffectiveMass, out data.EffectiveMass);
+        if (data.Clamp == 1 || data.Clamp == 2)
+        {
+            data.BilateralMass = MathHelper.InverseBilateralBlock(data.EffectiveMass);
+            data.CouplingX = data.EffectiveMass.M13;
+            data.CouplingY = data.EffectiveMass.M23;
+        }
 
-        data.Bias = error * idt;
+        // An inactive limit must not set the scale used to identify responsive rows.
+        if (data.Clamp == 0) data.EffectiveMass.M33 = 0;
+        data.EffectiveMass = MathHelper.InverseSymmetric(data.EffectiveMass);
+
+        data.Bias = error * timeStep.InverseStepDt;
         data.Bias.X *= data.BiasFactor;
         data.Bias.Y *= data.BiasFactor;
         data.Bias.Z *= data.LimitBias;
 
+        // A changed limit must not warm start with an impulse of the opposite sign.
+        if (data.Clamp == 1) data.AccumulatedImpulse.Z = MathR.Min(0, data.AccumulatedImpulse.Z);
+        else if (data.Clamp == 2) data.AccumulatedImpulse.Z = MathR.Max(0, data.AccumulatedImpulse.Z);
+
         JVector acc = data.AccumulatedImpulse;
 
-        body1.Velocity += body1.InverseMass * (jacobian[0] * acc.X + jacobian[4] * acc.Y + jacobian[8] * acc.Z);
-        body1.AngularVelocity += JVector.Transform(jacobian[1] * acc.X + jacobian[5] * acc.Y + jacobian[9] * acc.Z, body1.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity += JVector.Multiply(jacobian[0] * acc.X + jacobian[4] * acc.Y + jacobian[8] * acc.Z, body1.InverseMassVector);
+            body1.AngularVelocity += JVector.Transform(jacobian[1] * acc.X + jacobian[5] * acc.Y + jacobian[9] * acc.Z, body1.InverseInertiaWorld);
+        }
 
-        body2.Velocity += body2.InverseMass * (jacobian[2] * acc.X + jacobian[6] * acc.Y + jacobian[10] * acc.Z);
-        body2.AngularVelocity += JVector.Transform(jacobian[3] * acc.X + jacobian[7] * acc.Y + jacobian[11] * acc.Z, body2.InverseInertiaWorld);
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(jacobian[2] * acc.X + jacobian[6] * acc.Y + jacobian[10] * acc.Z, body2.InverseMassVector);
+            body2.AngularVelocity += JVector.Transform(jacobian[3] * acc.X + jacobian[7] * acc.Y + jacobian[11] * acc.Z, body2.InverseInertiaWorld);
+        }
     }
 
     /// <summary>
@@ -253,23 +309,31 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
     public Real Softness
     {
         get => Data.Softness;
-        set => Data.Softness = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.Softness = value;
+        }
     }
 
     /// <summary>
     /// Gets or sets the bias factor controlling how aggressively positional error is corrected.
     /// </summary>
     /// <value>
-    /// Default is 0.01. Range [0, 1]. Higher values correct errors faster but may cause instability.
+    /// Default is <see cref="Constraint.DefaultLinearBias"/>. Higher values correct errors faster but may cause instability.
     /// </value>
     public Real Bias
     {
         get => Data.BiasFactor;
-        set => Data.BiasFactor = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.BiasFactor = value;
+        }
     }
 
     /// <summary>
-    /// Gets the accumulated impulse applied by this constraint during the last step.
+    /// Gets the accumulated solver impulse from the last solved substep.
     /// </summary>
     public JVector Impulse => Data.AccumulatedImpulse;
 
@@ -282,23 +346,31 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
     public Real LimitSoftness
     {
         get => Data.LimitSoftness;
-        set => Data.LimitSoftness = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.LimitSoftness = value;
+        }
     }
 
     /// <summary>
     /// Gets or sets the bias factor for distance limit correction.
     /// </summary>
     /// <value>
-    /// Default is 0.2. Range [0, 1]. Higher values correct limit violations faster.
+    /// Default is 0.2. Higher values correct limit violations faster.
     /// </value>
     public Real LimitBias
     {
         get => Data.LimitBias;
-        set => Data.LimitBias = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.LimitBias = value;
+        }
     }
 
     [SkipLocalsInit]
-    public static void IteratePointOnLine(ref ConstraintData constraint, Real idt)
+    public static void IteratePointOnLine(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, PointOnLineData>(ref constraint);
         ref RigidBodyData body1 = ref constraint.Body1.Data;
@@ -346,22 +418,33 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
         jv.Z = jacobian[8] * body1.Velocity + jacobian[9] * body1.AngularVelocity + jacobian[10] * body2.Velocity +
                jacobian[11] * body2.AngularVelocity;
 
-        JVector softnessVector = data.AccumulatedImpulse * idt;
+        JVector softnessVector = data.AccumulatedImpulse * timeStep.InverseSubstepDt;
         softnessVector.X *= data.Softness;
         softnessVector.Y *= data.Softness;
         softnessVector.Z *= data.LimitSoftness;
 
-        JVector lambda = -(Real)1.0 * JVector.Transform(jv + data.Bias + softnessVector, data.EffectiveMass);
+        JVector residual = jv + data.Bias + softnessVector;
+        JVector lambda = -(Real)1.0 * JVector.Transform(residual, data.EffectiveMass);
 
         JVector origAcc = data.AccumulatedImpulse;
 
         data.AccumulatedImpulse += lambda;
 
-        if ((data.Clamp & 1) != 0)
-            data.AccumulatedImpulse.Z = MathR.Min(data.AccumulatedImpulse.Z, (Real)0.0);
-        else if ((data.Clamp & 2) != 0)
-            data.AccumulatedImpulse.Z = MathR.Max(data.AccumulatedImpulse.Z, (Real)0.0);
-        else
+        if ((data.Clamp == 1 && data.AccumulatedImpulse.Z > 0) ||
+            (data.Clamp == 2 && data.AccumulatedImpulse.Z < 0))
+        {
+            // Fix the limit impulse at its bound and solve the bilateral rows again.
+            // Their full block solution assumed that the discarded limit impulse was applied.
+            lambda.Z = -origAcc.Z;
+            Real x = residual.X + data.CouplingX * lambda.Z;
+            Real y = residual.Y + data.CouplingY * lambda.Z;
+            lambda.X = -(data.BilateralMass.X * x + data.BilateralMass.Y * y);
+            lambda.Y = -(data.BilateralMass.Y * x + data.BilateralMass.Z * y);
+            data.AccumulatedImpulse.X = origAcc.X + lambda.X;
+            data.AccumulatedImpulse.Y = origAcc.Y + lambda.Y;
+            data.AccumulatedImpulse.Z = 0;
+        }
+        else if (data.Clamp == 0)
         {
             data.AccumulatedImpulse.Z = (Real)0.0;
             origAcc.Z = (Real)0.0;
@@ -369,30 +452,55 @@ public unsafe class PointOnLine : Constraint<PointOnLine.PointOnLineData>
 
         lambda = data.AccumulatedImpulse - origAcc;
 
-        body1.Velocity += body1.InverseMass * (jacobian[0] * lambda.X + jacobian[4] * lambda.Y + jacobian[8] * lambda.Z);
-        body1.AngularVelocity += JVector.Transform(jacobian[1] * lambda.X + jacobian[5] * lambda.Y + jacobian[9] * lambda.Z, body1.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity += JVector.Multiply(jacobian[0] * lambda.X + jacobian[4] * lambda.Y + jacobian[8] * lambda.Z, body1.InverseMassVector);
+            body1.AngularVelocity += JVector.Transform(jacobian[1] * lambda.X + jacobian[5] * lambda.Y + jacobian[9] * lambda.Z, body1.InverseInertiaWorld);
+        }
 
-        body2.Velocity += body2.InverseMass * (jacobian[2] * lambda.X + jacobian[6] * lambda.Y + jacobian[10] * lambda.Z);
-        body2.AngularVelocity += JVector.Transform(jacobian[3] * lambda.X + jacobian[7] * lambda.Y + jacobian[11] * lambda.Z, body2.InverseInertiaWorld);
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(jacobian[2] * lambda.X + jacobian[6] * lambda.Y + jacobian[10] * lambda.Z, body2.InverseMassVector);
+            body2.AngularVelocity += JVector.Transform(jacobian[3] * lambda.X + jacobian[7] * lambda.Y + jacobian[11] * lambda.Z, body2.InverseInertiaWorld);
+        }
     }
 
-    public override void DebugDraw(IDebugDrawer drawer)
+    public override void DebugDraw(IDebugDrawer drawer) => DebugDraw(drawer, DebugDrawSettings.Default);
+
+    /// <inheritdoc />
+    public override void DebugDraw(IDebugDrawer drawer, in DebugDrawSettings settings)
     {
+        ArgumentNullException.ThrowIfNull(drawer);
+        VerifyNotZero();
         ref PointOnLineData data = ref Data;
-        ref RigidBodyData body1 = ref data.Body1.Data;
-        ref RigidBodyData body2 = ref data.Body2.Data;
-
-        JVector.Transform(data.LocalAnchor1, body1.Orientation, out JVector r1);
-        JVector.Transform(data.LocalAnchor2, body2.Orientation, out JVector r2);
-        JVector.Transform(data.LocalAxis, body1.Orientation, out JVector axis);
-
-        JVector p1 = body1.Position + r1;
-        JVector p2 = body2.Position + r2;
-
-        Real lineLength = (Real)1.0;
-        drawer.DrawSegment(p1 - axis * lineLength, p1 + axis * lineLength);
-        drawer.DrawSegment(body2.Position, p2);
-        drawer.DrawPoint(p1);
-        drawer.DrawPoint(p2);
+        JVector first = Body1.Position + JVector.Transform(data.LocalAnchor1, Body1.Orientation);
+        JVector second = Body2.Position + JVector.Transform(data.LocalAnchor2, Body2.Orientation);
+        JVector axis = JVector.Transform(data.LocalAxis, Body1.Orientation);
+        Real distance = JVector.Dot(second - first, axis);
+        JVector projected = first + axis * distance;
+        Real minimum = data.Min, maximum = data.Max;
+        if (minimum >= maximum) minimum = maximum = minimum * (Real)0.5 + maximum * (Real)0.5;
+        Real start = Real.IsFinite(minimum) ? minimum : MathR.Min(-settings.GuideSize, distance - settings.GuideSize);
+        Real end = Real.IsFinite(maximum) ? maximum : MathR.Max(settings.GuideSize, distance + settings.GuideSize);
+        if (!Real.IsFinite(minimum) && Real.IsFinite(maximum)) start = MathR.Min(start, maximum - settings.GuideSize);
+        if (!Real.IsFinite(maximum) && Real.IsFinite(minimum)) end = MathR.Max(end, minimum + settings.GuideSize);
+        if (Real.IsFinite(start) && Real.IsFinite(end))
+        {
+            drawer.DrawSegment(first + axis * start, first + axis * end, settings.ReferenceColor);
+            if (Real.IsFinite(minimum))
+                drawer.DrawStop(first + axis * minimum, axis, settings.GuideSize * (Real)0.15,
+                    minimum == maximum ? settings.UpperLimitColor : settings.LowerLimitColor);
+            else drawer.DrawArrow(first + axis * start, -axis * (settings.GuideSize * (Real)0.25),
+                settings.ReferenceColor, settings);
+            if (Real.IsFinite(maximum) && minimum != maximum)
+                drawer.DrawStop(first + axis * maximum, axis, settings.GuideSize * (Real)0.15, settings.UpperLimitColor);
+            else if (!Real.IsFinite(maximum))
+                drawer.DrawArrow(first + axis * end, axis * (settings.GuideSize * (Real)0.25),
+                    settings.ReferenceColor, settings);
+        }
+        if (Body2 != Body2.World.NullBody) drawer.DrawSegment(Body2.Position, second, settings.CurrentColor);
+        drawer.DrawSegment(second, projected, settings.CurrentColor);
+        drawer.DrawPoint(first, settings.PointRadius, settings.ReferenceColor);
+        drawer.DrawPoint(second, settings.PointRadius, settings.CurrentColor);
     }
 }

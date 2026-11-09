@@ -18,12 +18,11 @@ namespace Jitter2.Unmanaged;
 /// <typeparam name="T">The unmanaged type of the data.</typeparam>
 /// <remarks>
 /// <para>
-/// <b>Validity:</b> A handle is valid only while the owning <see cref="PartitionedBuffer{T}"/>
-/// exists and the element has not been freed via <see cref="PartitionedBuffer{T}.Free"/>.
+/// A handle is valid until its element is freed or its buffer is disposed.
 /// </para>
 /// <para>
-/// <b>Do not cache</b> the <see cref="Data"/> reference across operations that may resize
-/// the buffer. Use the handle to obtain a fresh reference when needed.
+/// Buffer changes can move elements in memory. Keep the handle, and obtain a fresh
+/// <see cref="Data"/> reference after changing the buffer.
 /// </para>
 /// </remarks>
 public readonly unsafe struct JHandle<T> : IEquatable<JHandle<T>> where T : unmanaged
@@ -46,18 +45,19 @@ public readonly unsafe struct JHandle<T> : IEquatable<JHandle<T>> where T : unma
     }
 
     /// <summary>
-    /// Gets a value indicating whether this handle is null/invalid.
+    /// Gets whether this is the zero handle.
     /// </summary>
+    /// <remarks>A freed handle can remain nonzero. This property does not check whether its element is still valid.</remarks>
     public readonly bool IsZero => Pointer == null;
 
     /// <summary>
-    /// Reinterprets a handle as a handle to a different type. Both types must have compatible layouts.
+    /// Reinterprets a handle as a handle to a different type.
     /// </summary>
     /// <typeparam name="TConvert">The target unmanaged type to reinterpret as.</typeparam>
     /// <param name="handle">The handle to reinterpret.</param>
     /// <returns>A handle reinterpreted as the target type.</returns>
     /// <remarks>
-    /// <b>Safety:</b> The caller must ensure that <typeparamref name="T"/> and <typeparamref name="TConvert"/>
+    /// The caller must ensure that <typeparamref name="T"/> and <typeparamref name="TConvert"/>
     /// have compatible memory layouts. No runtime validation is performed.
     /// </remarks>
     public static JHandle<TConvert> AsHandle<TConvert>(JHandle<T> handle) where TConvert : unmanaged
@@ -92,42 +92,39 @@ public readonly unsafe struct JHandle<T> : IEquatable<JHandle<T>> where T : unma
 }
 
 /// <summary>
-/// Manages memory for unmanaged structs, storing them sequentially in contiguous memory blocks.
-/// Each struct can either be active or inactive.
+/// Stores unmanaged structs in a resizable buffer with active and inactive partitions.
 /// </summary>
 /// <typeparam name="T">The unmanaged type to store. Must be at least 4 bytes in size.</typeparam>
 /// <remarks>
 /// <para>
-/// <b>Memory Layout Requirement:</b> The type <typeparamref name="T"/> must reserve its first
-/// 4 bytes (sizeof(int)) for internal bookkeeping. This memory region is used to store
-/// the stable ID that maps the data back to its <see cref="JHandle{T}"/>.
+/// Reserve the first 4 bytes of <typeparamref name="T"/> for the buffer's element ID.
+/// Do not overwrite these bytes. Place an integer at offset zero, for example as the first field
+/// of a sequential layout:
 /// </para>
-/// <para>
-/// Do not modify these bytes manually. A compatible struct should look like this:
 /// <code>
 /// [StructLayout(LayoutKind.Sequential)]
-/// public struct RigidBodyData
+/// public struct MyData
 /// {
-///     private readonly int _internalIndex; // Reserved by PartitionedBuffer
+///     private readonly int _index; // Reserved by PartitionedBuffer
 ///
 ///     public JVector Position;
 ///     public JQuaternion Orientation;
 ///     // ... other fields
 /// }
 /// </code>
+/// <para>
+/// Do not modify the buffer concurrently. Readers that may run during an allocation must hold
+/// a read lock on <see cref="ResizeLock"/>. This protects against resizing only; callers must
+/// also prevent reads from conflicting with element moves or writes.
 /// </para>
 /// <para>
-/// <b>Threading:</b> Concurrent calls to <see cref="Allocate"/> may trigger a resize. Use
-/// <see cref="ResizeLock"/> to synchronize access when reading data concurrently with allocations.
-/// </para>
-/// <para>
-/// <b>Disposal:</b> This class owns unmanaged memory and must be disposed to avoid memory leaks.
+/// Dispose the buffer when it is no longer needed to release its unmanaged memory.
 /// </para>
 /// </remarks>
 public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanaged
 {
     /// <summary>
-    /// Exception thrown when the buffer's internal indirection table reaches its maximum capacity.
+    /// Thrown when the buffer reaches its maximum element capacity.
     /// </summary>
     public class MaximumSizeException : Exception
     {
@@ -141,6 +138,7 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
     private const int PageMask = PageSize - 1;
     private const int PageShift = 12; // 2^12 = 4096
     private const int MaxPages = 1024 * 16; // Capacity for ~67 million handles
+    private const int MaximumCapacity = MaxPages * PageSize;
 
     private T* memory;
     private T*** pages; // Array of pointers to pages (indirection table)
@@ -151,11 +149,10 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
     private bool disposed;
 
     /// <summary>
-    /// Reader-writer lock. Locked by a writer when a resize occurs.
-    /// Resizing moves the contiguous data memory addresses. Use a reader lock
-    /// to access data if concurrent calls to Allocate are made.
+    /// Protects data access while an allocation may resize the buffer.
     /// </summary>
-    public ReaderWriterLock ResizeLock;
+    /// <remarks>Acquire a read lock before accessing data concurrently with <see cref="Allocate"/>.</remarks>
+    public readonly ReaderWriterLock ResizeLock = new();
 
     /// <summary>
     /// Gets the number of allocated elements in the buffer.
@@ -172,8 +169,17 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
     /// </summary>
     /// <param name="initialSize">The initial size of the contiguous memory block.</param>
     /// <param name="aligned64">Indicates whether the memory should be aligned to 64 bytes.</param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <typeparamref name="T"/> is too small to store the internal element ID.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="initialSize"/> is less than one or exceeds the maximum capacity.
+    /// </exception>
     public PartitionedBuffer(int initialSize = 1024, bool aligned64 = false)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(initialSize, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(initialSize, MaximumCapacity);
+
         if (sizeof(T) < sizeof(int))
         {
             throw new ArgumentException($"Type {typeof(T).Name} is too small. It must be at least {sizeof(int)} bytes to store the internal ID.");
@@ -186,7 +192,7 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
 
         if (aligned64)
         {
-            try { memory = (T*)MemoryHelper.AlignedAllocateHeap(size * sizeof(T), 64); }
+            try { memory = MemoryHelper.AlignedAllocateHeap<T>(size, 64); }
             catch
             {
                 Logger.Warning("Could not allocate aligned memory. Falling back to unaligned memory.");
@@ -196,7 +202,7 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
 
         if (!aligned64)
         {
-            memory = (T*)MemoryHelper.AllocateHeap(size * sizeof(T));
+            memory = MemoryHelper.AllocateHeap<T>(size);
         }
 
         this.Aligned64 = aligned64;
@@ -211,7 +217,7 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
     }
 
     /// <summary>
-    /// Returns the total amount of unmanaged memory allocated in bytes (data + indirection pages + master page table).
+    /// Returns the total number of bytes of unmanaged memory owned by the buffer, including handle storage.
     /// </summary>
     public long TotalBytesAllocated => (long)size * sizeof(T) + (long)pageCount * PageSize * sizeof(IntPtr) + MaxPages * sizeof(IntPtr);
 
@@ -234,7 +240,7 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
     }
 
     /// <summary>
-    /// Removes the associated native structure from the buffer and invalidates the handle.
+    /// Removes the associated unmanaged element from the buffer and invalidates the handle.
     /// </summary>
     /// <param name="handle">The handle to free.</param>
     /// <remarks>
@@ -245,15 +251,42 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
     {
         Debug.Assert(!disposed);
 
-        MoveToInactive(handle);
+        T* element = *handle.Pointer;
+        int index = (int)(element - memory);
+        int lastIndex = Count - 1;
+        int freedId = Unsafe.Read<int>(element);
 
-        Count -= 1;
-        // Swap with the last element
-        (**handle.Pointer, memory[Count]) = (memory[Count], **handle.Pointer);
+        Debug.Assert((uint)index < (uint)Count);
 
-        // Update the handle slots for the two swapped elements
-        *GetHandleSlot(Unsafe.Read<int>(*handle.Pointer)) = *handle.Pointer;
-        *GetHandleSlot(Unsafe.Read<int>(&memory[Count])) = &memory[Count];
+        // Only surviving elements need to be preserved. Fill the active hole from the
+        // active boundary, then fill the resulting inactive hole from the last element.
+        if (index < activeCount)
+        {
+            int lastActiveIndex = activeCount - 1;
+
+            if (index != lastActiveIndex)
+            {
+                memory[index] = memory[lastActiveIndex];
+                *GetHandleSlot(Unsafe.Read<int>(&memory[index])) = &memory[index];
+            }
+
+            activeCount = lastActiveIndex;
+
+            if (lastActiveIndex != lastIndex)
+            {
+                memory[lastActiveIndex] = memory[lastIndex];
+                *GetHandleSlot(Unsafe.Read<int>(&memory[lastActiveIndex])) = &memory[lastActiveIndex];
+            }
+        }
+        else if (index != lastIndex)
+        {
+            memory[index] = memory[lastIndex];
+            *GetHandleSlot(Unsafe.Read<int>(&memory[index])) = &memory[index];
+        }
+
+        Count = lastIndex;
+        Unsafe.AsRef<int>(&memory[lastIndex]) = freedId;
+        *handle.Pointer = &memory[lastIndex];
     }
 
     /// <summary>
@@ -358,15 +391,19 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
     }
 
     /// <summary>
-    /// Allocates an unmanaged object. Growth is dynamic.
+    /// Adds an element, growing the buffer if needed.
     /// </summary>
     /// <param name="active">If <see langword="true"/>, the element is added to the active partition.</param>
     /// <param name="clear">If <see langword="true"/>, the element's memory (excluding the internal ID) is zeroed.</param>
     /// <returns>A handle to the newly allocated element.</returns>
     /// <remarks>
-    /// <b>Threading:</b> This method may resize the buffer, which moves all data. Use
-    /// <see cref="ResizeLock"/> when calling concurrently with data access.
+    /// Do not call concurrently with other modifications. This method can move existing elements;
+    /// obtain fresh data references afterward. Use <see cref="ResizeLock"/> to protect concurrent readers
+    /// against resizing.
     /// </remarks>
+    /// <exception cref="MaximumSizeException">
+    /// Thrown when the internal indirection table limit is reached.
+    /// </exception>
     public JHandle<T> Allocate(bool active = false, bool clear = false)
     {
         Debug.Assert(!disposed);
@@ -375,38 +412,77 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
         {
             ResizeLock.EnterWriteLock();
 
-            int oldSize = size;
-            size *= 2; // Dynamic doubling
+            T* newMemory = null;
+            bool published = false;
 
-            T* oldMemory = memory;
-
-            if (Aligned64) memory = (T*)MemoryHelper.AlignedAllocateHeap(size * sizeof(T), 64);
-            else memory = (T*)MemoryHelper.AllocateHeap(size * sizeof(T));
-
-            // Ensure handles are ready for the new memory range
-            EnsureHandleCapacity(size);
-
-            for (int i = 0; i < oldSize; i++)
+            try
             {
-                memory[i] = oldMemory[i];
-                // Update stable pointers to the new memory location
-                *GetHandleSlot(Unsafe.Read<int>(&memory[i])) = &memory[i];
-            }
+                int oldSize = size;
+                if (size == MaximumCapacity)
+                {
+                    throw new MaximumSizeException("Internal indirection table limit reached.");
+                }
 
-            for (int i = oldSize; i < size; i++)
+                int newSize = Math.Min(checked(size * 2), MaximumCapacity);
+                T* oldMemory = memory;
+
+                if (Aligned64) newMemory = MemoryHelper.AlignedAllocateHeap<T>(newSize, 64);
+                else newMemory = MemoryHelper.AllocateHeap<T>(newSize);
+
+                // Ensure handles are ready before publishing any new data pointers.
+                EnsureHandleCapacity(newSize);
+
+                for (int i = 0; i < oldSize; i++)
+                {
+                    newMemory[i] = oldMemory[i];
+                }
+
+                for (int i = oldSize; i < newSize; i++)
+                {
+                    Unsafe.AsRef<int>(&newMemory[i]) = i;
+                }
+
+                for (int i = 0; i < oldSize; i++)
+                {
+                    *GetHandleSlot(Unsafe.Read<int>(&newMemory[i])) = &newMemory[i];
+                }
+
+                memory = newMemory;
+                size = newSize;
+                published = true;
+
+                if (Aligned64) MemoryHelper.AlignedFree(oldMemory);
+                else MemoryHelper.Free(oldMemory);
+            }
+            finally
             {
-                Unsafe.AsRef<int>(&memory[i]) = i;
+                if (!published && newMemory != null)
+                {
+                    if (Aligned64) MemoryHelper.AlignedFree(newMemory);
+                    else MemoryHelper.Free(newMemory);
+                }
+
+                ResizeLock.ExitWriteLock();
             }
-
-            if (Aligned64) MemoryHelper.AlignedFree(oldMemory);
-            else MemoryHelper.Free(oldMemory);
-
-            ResizeLock.ExitWriteLock();
         }
 
-        int hdlId = Unsafe.Read<int>(&memory[Count]);
+        int freeIndex = Count;
+        int hdlId = Unsafe.Read<int>(&memory[freeIndex]);
         T** slot = GetHandleSlot(hdlId);
-        *slot = &memory[Count];
+
+        int targetIndex = freeIndex;
+
+        // Place a new active element directly at the active boundary. The inactive
+        // element displaced from there only needs to be moved once, into the free slot.
+        if (active && activeCount != Count)
+        {
+            targetIndex = activeCount;
+            memory[freeIndex] = memory[targetIndex];
+            *GetHandleSlot(Unsafe.Read<int>(&memory[freeIndex])) = &memory[freeIndex];
+            Unsafe.AsRef<int>(&memory[targetIndex]) = hdlId;
+        }
+
+        *slot = &memory[targetIndex];
 
         var handle = new JHandle<T>(slot);
 
@@ -417,7 +493,7 @@ public sealed unsafe class PartitionedBuffer<T> : IDisposable where T : unmanage
         }
 
         Count += 1;
-        if (active) MoveToActive(handle);
+        if (active) activeCount += 1;
 
         return handle;
     }

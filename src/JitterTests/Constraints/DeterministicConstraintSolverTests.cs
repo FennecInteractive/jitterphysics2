@@ -4,6 +4,87 @@ namespace JitterTests.Constraints;
 
 public class DeterministicConstraintSolverTests
 {
+    [TestCase(true)]
+    [TestCase(false)]
+    public void DeterministicSingleThreadPathSolvesIslandsOnCallingThread(bool stabilize)
+    {
+        const int islandCount = 16;
+        const int solverIterations = 2;
+
+        var threadPool = Jitter2.Parallelization.ThreadPool.Instance;
+        int previousThreadCount = threadPool.ThreadCount;
+        threadPool.ChangeThreadCount(Math.Max(previousThreadCount, 2));
+
+        var world = new World
+        {
+            Gravity = JVector.Zero,
+            AllowDeactivation = false,
+            SolveMode = SolveMode.Deterministic,
+            SubstepCount = 2,
+            SolverIterations = (solverIterations, 0)
+        };
+
+        try
+        {
+            for (int i = 0; i < islandCount; i++)
+            {
+                CreateCountingConstraintIsland(world, i);
+            }
+
+            CountingConstraint.ResetCounters();
+            CountingConstraint.ExpectCallbacksOnCurrentThread();
+
+            if (stabilize)
+            {
+                world.Stabilize(1f / 60f, solverIterations, multiThread: false);
+            }
+            else
+            {
+                world.Step(1f / 60f, multiThread: false);
+            }
+
+            Assert.That(CountingConstraint.UnexpectedThreadCount, Is.EqualTo(0));
+            Assert.That(CountingConstraint.PrepareCount, Is.EqualTo(world.SubstepCount * islandCount));
+            Assert.That(CountingConstraint.IterateCount, Is.EqualTo(world.SubstepCount * islandCount * solverIterations));
+        }
+        finally
+        {
+            CountingConstraint.ResetCounters();
+            world.Dispose();
+            threadPool.ChangeThreadCount(previousThreadCount);
+            threadPool.PauseWorkers();
+        }
+    }
+
+    [TestCase]
+    public void Stabilize_UsesRequestedIterationsInDeterministicSolver()
+    {
+        var world = new World
+        {
+            Gravity = JVector.Zero,
+            AllowDeactivation = false,
+            SolveMode = SolveMode.Deterministic,
+            SubstepCount = 3
+        };
+
+        world.SolverIterations = (12, 6);
+
+        var bodyA = world.CreateRigidBody();
+        bodyA.AddShape(new SphereShape(1));
+
+        var bodyB = world.CreateRigidBody();
+        bodyB.AddShape(new SphereShape(1));
+
+        CountingConstraint.ResetCounters();
+        world.CreateConstraint<CountingConstraint>(bodyA, bodyB);
+
+        world.Stabilize(1f / 60f, solverIterations: 2, relaxationIterations: 0, multiThread: false);
+
+        Assert.That(CountingConstraint.PrepareCount, Is.EqualTo(world.SubstepCount));
+        Assert.That(CountingConstraint.IterateCount, Is.EqualTo(world.SubstepCount * 2));
+        world.Dispose();
+    }
+
     [TestCase]
     public void DistanceLimit_WorksInDeterministicSolver()
     {
@@ -145,7 +226,7 @@ public class DeterministicConstraintSolverTests
         var motor = world.CreateConstraint<AngularMotor>(world.NullBody, body);
         motor.Initialize(JVector.UnitY, JVector.UnitY);
         motor.TargetVelocity = (Real)3.0;
-        motor.MaximumForce = (Real)100.0;
+        motor.MaximumTorque = (Real)100.0;
 
         Helper.AdvanceWorld(world, 1, 1f / 100f, true);
 
@@ -256,5 +337,83 @@ public class DeterministicConstraintSolverTests
         Assert.That(unconstrained, Is.GreaterThan((Real)0.4));
         Assert.That(constrained, Is.LessThan(unconstrained));
         Assert.That(constrained, Is.LessThan((Real)0.4));
+    }
+
+    private static void CreateCountingConstraintIsland(World world, int index)
+    {
+        var bodyA = world.CreateRigidBody();
+        bodyA.AddShape(new SphereShape(1));
+        bodyA.Position = new JVector((Real)(index * 10.0), 0, 0);
+
+        var bodyB = world.CreateRigidBody();
+        bodyB.AddShape(new SphereShape(1));
+        bodyB.Position = new JVector((Real)(index * 10.0 + 3.0), 0, 0);
+
+        world.CreateConstraint<CountingConstraint>(bodyA, bodyB);
+    }
+
+    public unsafe class CountingConstraint : Constraint<CountingConstraint.CountingConstraintData>
+    {
+        public struct CountingConstraintData
+        {
+            public ConstraintData FullSizeMarker;
+        }
+
+        private static readonly uint RegisteredDispatchId =
+            RegisterFullConstraint(&PrepareForIterationCountingConstraint, &IterateCountingConstraint);
+
+        private static int prepareCount;
+        private static int iterateCount;
+        private static int unexpectedThreadCount;
+        private static int expectedThreadId = -1;
+
+        public static int PrepareCount => prepareCount;
+        public static int IterateCount => iterateCount;
+        public static int UnexpectedThreadCount => unexpectedThreadCount;
+
+        public static void ResetCounters()
+        {
+            prepareCount = 0;
+            iterateCount = 0;
+            unexpectedThreadCount = 0;
+            expectedThreadId = -1;
+        }
+
+        public static void ExpectCallbacksOnCurrentThread()
+        {
+            unexpectedThreadCount = 0;
+            expectedThreadId = Environment.CurrentManagedThreadId;
+        }
+
+        protected override void Create()
+        {
+            base.Create();
+            DispatchId = RegisteredDispatchId;
+        }
+
+        public static void PrepareForIterationCountingConstraint(ref ConstraintData constraint, in TimeStep timeStep)
+        {
+            RecordCallbackThread();
+            System.Threading.Interlocked.Increment(ref prepareCount);
+        }
+
+        public static void IterateCountingConstraint(ref ConstraintData constraint, in TimeStep timeStep)
+        {
+            RecordCallbackThread();
+            System.Threading.Interlocked.Increment(ref iterateCount);
+        }
+
+        private static void RecordCallbackThread()
+        {
+            if (expectedThreadId < 0) return;
+
+            if (Environment.CurrentManagedThreadId != expectedThreadId)
+            {
+                System.Threading.Interlocked.Increment(ref unexpectedThreadCount);
+                return;
+            }
+
+            System.Threading.Thread.Sleep(1);
+        }
     }
 }

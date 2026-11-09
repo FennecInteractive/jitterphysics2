@@ -13,12 +13,14 @@ using Jitter2.Unmanaged;
 namespace Jitter2.Dynamics.Constraints;
 
 /// <summary>
-/// Constrains a fixed point in the reference frame of one body to a plane that is fixed in
-/// the reference frame of another body. This constraint removes one degree of translational
-/// freedom if the limit is enforced.
+/// Limits an anchor on body 2 to a plane or a range of distances from a plane attached to body 1.
+/// Movement along the plane and relative rotation remain free.
 /// </summary>
 public unsafe class PointOnPlane : Constraint<PointOnPlane.SliderData>
 {
+    /// <inheritdoc />
+    public override string ToString() => FormatDescription(nameof(PointOnPlane));
+
     [StructLayout(LayoutKind.Sequential)]
     public struct SliderData
     {
@@ -44,6 +46,7 @@ public unsafe class PointOnPlane : Constraint<PointOnPlane.SliderData>
         public Real Min;
         public Real Max;
 
+        // 0: inactive, 1: upper limit, 2: lower limit, 3: bilateral fixed limit.
         public ushort Clamp;
 
         public MemoryHelper.MemBlock12Real J0;
@@ -75,12 +78,24 @@ public unsafe class PointOnPlane : Constraint<PointOnPlane.SliderData>
     /// <param name="anchor2">Anchor point on body 2 constrained to the plane in world space.</param>
     /// <param name="limit">Distance limit from the plane.</param>
     /// <remarks>
-    /// Computes local anchor points and axis from the current body poses.
+    /// Equal or reversed distance limits fix the distance at their midpoint.
+    /// Use <see cref="LinearLimit.Fixed"/> to keep the anchor on the plane.
     /// Default values: <see cref="Bias"/> = <see cref="Constraint.DefaultLinearBias"/>, <see cref="Softness"/> = <see cref="Constraint.DefaultLinearSoftness"/>.
     /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="axis"/> is zero or contains a non-finite value, when
+    /// <paramref name="anchor1"/> or <paramref name="anchor2"/> contains a non-finite value,
+    /// or when either value in <paramref name="limit"/> is NaN.
+    /// </exception>
     public void Initialize(JVector axis, JVector anchor1, JVector anchor2, LinearLimit limit)
     {
         VerifyNotZero();
+        ArgumentCheck.NonZero(axis, nameof(axis));
+        ArgumentCheck.Finite(anchor1, nameof(anchor1));
+        ArgumentCheck.Finite(anchor2, nameof(anchor2));
+        ArgumentCheck.NotNaN(limit.From, nameof(limit.From));
+        ArgumentCheck.NotNaN(limit.To, nameof(limit.To));
+
         ref SliderData data = ref Data;
         ref RigidBodyData body1 = ref data.Body1.Data;
         ref RigidBodyData body2 = ref data.Body2.Data;
@@ -101,7 +116,7 @@ public unsafe class PointOnPlane : Constraint<PointOnPlane.SliderData>
         (data.Min, data.Max) = limit;
     }
 
-    public static void PrepareForIterationPointOnPlane(ref ConstraintData constraint, Real idt)
+    public static void PrepareForIterationPointOnPlane(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, SliderData>(ref constraint);
         ref RigidBodyData body1 = ref data.Body1.Data;
@@ -130,12 +145,17 @@ public unsafe class PointOnPlane : Constraint<PointOnPlane.SliderData>
 
         data.EffectiveMass = (Real)1.0;
 
-        if (error > data.Max)
+        if (data.Min >= data.Max)
+        {
+            error -= (Real)0.5 * data.Min + (Real)0.5 * data.Max;
+            data.Clamp = 3;
+        }
+        else if (error >= data.Max)
         {
             error -= data.Max;
             data.Clamp = 1;
         }
-        else if (error < data.Min)
+        else if (error <= data.Min)
         {
             error -= data.Min;
             data.Clamp = 2;
@@ -146,22 +166,30 @@ public unsafe class PointOnPlane : Constraint<PointOnPlane.SliderData>
             return;
         }
 
-        data.EffectiveMass = body1.InverseMass + body2.InverseMass +
+        data.EffectiveMass = JVector.Multiply(jacobian[0], body1.InverseMassVector) * jacobian[0] +
+                             JVector.Multiply(jacobian[2], body2.InverseMassVector) * jacobian[2] +
                              JVector.Transform(jacobian[1], body1.InverseInertiaWorld) * jacobian[1] +
                              JVector.Transform(jacobian[3], body2.InverseInertiaWorld) * jacobian[3];
 
-        data.EffectiveMass += (data.Softness * idt);
-        data.EffectiveMass = (Real)1.0 / data.EffectiveMass;
+        data.EffectiveMass += (data.Softness * timeStep.InverseSubstepDt);
+        data.EffectiveMass = data.EffectiveMass > 0 ? (Real)1.0 / data.EffectiveMass : 0;
+        if (data.EffectiveMass == 0) data.AccumulatedImpulse = 0;
 
-        data.Bias = error * data.BiasFactor * idt;
+        data.Bias = error * data.BiasFactor * timeStep.InverseStepDt;
 
         Real acc = data.AccumulatedImpulse;
 
-        body1.Velocity += body1.InverseMass * (jacobian[0] * acc);
-        body1.AngularVelocity += JVector.Transform(jacobian[1] * acc, body1.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity += JVector.Multiply(jacobian[0] * acc, body1.InverseMassVector);
+            body1.AngularVelocity += JVector.Transform(jacobian[1] * acc, body1.InverseInertiaWorld);
+        }
 
-        body2.Velocity += body2.InverseMass * (jacobian[2] * acc);
-        body2.AngularVelocity += JVector.Transform(jacobian[3] * acc, body2.InverseInertiaWorld);
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(jacobian[2] * acc, body2.InverseMassVector);
+            body2.AngularVelocity += JVector.Transform(jacobian[3] * acc, body2.InverseInertiaWorld);
+        }
     }
 
     /// <summary>
@@ -173,27 +201,35 @@ public unsafe class PointOnPlane : Constraint<PointOnPlane.SliderData>
     public Real Softness
     {
         get => Data.Softness;
-        set => Data.Softness = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.Softness = value;
+        }
     }
 
     /// <summary>
     /// Gets or sets the bias factor controlling how aggressively positional error is corrected.
     /// </summary>
     /// <value>
-    /// Default is 0.01. Range [0, 1]. Higher values correct errors faster but may cause instability.
+    /// Default is <see cref="Constraint.DefaultLinearBias"/>. Higher values correct errors faster but may cause instability.
     /// </value>
     public Real Bias
     {
         get => Data.BiasFactor;
-        set => Data.BiasFactor = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.BiasFactor = value;
+        }
     }
 
     /// <summary>
-    /// Gets the accumulated impulse applied by this constraint during the last step.
+    /// Gets the accumulated solver impulse from the last solved substep.
     /// </summary>
     public Real Impulse => Data.AccumulatedImpulse;
 
-    public static void IteratePointOnPlane(ref ConstraintData constraint, Real idt)
+    public static void IteratePointOnPlane(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, SliderData>(ref constraint);
         ref RigidBodyData body1 = ref constraint.Body1.Data;
@@ -206,7 +242,7 @@ public unsafe class PointOnPlane : Constraint<PointOnPlane.SliderData>
         Real jv = jacobian[0] * body1.Velocity + jacobian[1] * body1.AngularVelocity + jacobian[2] * body2.Velocity +
                    jacobian[3] * body2.AngularVelocity;
 
-        Real softness = data.AccumulatedImpulse * data.Softness * idt;
+        Real softness = data.AccumulatedImpulse * data.Softness * timeStep.InverseSubstepDt;
 
         Real lambda = -(Real)1.0 * (jv + data.Bias + softness) * data.EffectiveMass;
 
@@ -218,37 +254,62 @@ public unsafe class PointOnPlane : Constraint<PointOnPlane.SliderData>
         {
             data.AccumulatedImpulse = MathR.Min(data.AccumulatedImpulse, (Real)0.0);
         }
-        else
+        else if (data.Clamp == 2)
         {
             data.AccumulatedImpulse = MathR.Max(data.AccumulatedImpulse, (Real)0.0);
         }
 
         lambda = data.AccumulatedImpulse - origAcc;
 
-        body1.Velocity += body1.InverseMass * (jacobian[0] * lambda);
-        body1.AngularVelocity += JVector.Transform(jacobian[1] * lambda, body1.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity += JVector.Multiply(jacobian[0] * lambda, body1.InverseMassVector);
+            body1.AngularVelocity += JVector.Transform(jacobian[1] * lambda, body1.InverseInertiaWorld);
+        }
 
-        body2.Velocity += body2.InverseMass * (jacobian[2] * lambda);
-        body2.AngularVelocity += JVector.Transform(jacobian[3] * lambda, body2.InverseInertiaWorld);
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(jacobian[2] * lambda, body2.InverseMassVector);
+            body2.AngularVelocity += JVector.Transform(jacobian[3] * lambda, body2.InverseInertiaWorld);
+        }
     }
 
-    public override void DebugDraw(IDebugDrawer drawer)
+    public override void DebugDraw(IDebugDrawer drawer) => DebugDraw(drawer, DebugDrawSettings.Default);
+
+    /// <inheritdoc />
+    public override void DebugDraw(IDebugDrawer drawer, in DebugDrawSettings settings)
     {
+        ArgumentNullException.ThrowIfNull(drawer);
+        VerifyNotZero();
         ref SliderData data = ref Data;
-        ref RigidBodyData body1 = ref data.Body1.Data;
-        ref RigidBodyData body2 = ref data.Body2.Data;
-
-        JVector.Transform(data.LocalAnchor1, body1.Orientation, out JVector r1);
-        JVector.Transform(data.LocalAnchor2, body2.Orientation, out JVector r2);
-        JVector.Transform(data.LocalAxis, body1.Orientation, out JVector axis);
-
-        JVector p1 = body1.Position + r1;
-        JVector p2 = body2.Position + r2;
-
-        Real normalLength = (Real)0.5;
-        drawer.DrawSegment(p1, p1 + axis * normalLength);
-        drawer.DrawSegment(body2.Position, p2);
-        drawer.DrawPoint(p1);
-        drawer.DrawPoint(p2);
+        JVector first = Body1.Position + JVector.Transform(data.LocalAnchor1, Body1.Orientation);
+        JVector second = Body2.Position + JVector.Transform(data.LocalAnchor2, Body2.Orientation);
+        JVector normal = JVector.Transform(data.LocalAxis, Body1.Orientation);
+        JVector reference = JVector.Transform(MathHelper.CreateOrthonormal(data.LocalAxis), Body1.Orientation);
+        Real minimum = data.Min, maximum = data.Max;
+        if (minimum >= maximum)
+        {
+            Real offset = minimum * (Real)0.5 + maximum * (Real)0.5;
+            if (Real.IsFinite(offset))
+                drawer.DrawPlane(first + normal * offset, normal, reference, settings.GuideSize, settings.UpperLimitColor);
+        }
+        else
+        {
+            if (Real.IsFinite(minimum))
+                drawer.DrawPlane(first + normal * minimum, normal, reference, settings.GuideSize, settings.LowerLimitColor);
+            if (Real.IsFinite(maximum))
+                drawer.DrawPlane(first + normal * maximum, normal, reference, settings.GuideSize, settings.UpperLimitColor);
+            if (!Real.IsFinite(minimum) && !Real.IsFinite(maximum))
+                drawer.DrawPlane(first, normal, reference, settings.GuideSize, settings.ReferenceColor);
+        }
+        drawer.DrawArrow(first, normal * (settings.GuideSize * (Real)0.4), settings.ReferenceColor, settings);
+        if (Body2 != Body2.World.NullBody) drawer.DrawSegment(Body2.Position, second, settings.CurrentColor);
+        Real distance = JVector.Dot(second - first, normal);
+        Real target = minimum >= maximum ? minimum * (Real)0.5 + maximum * (Real)0.5
+            : Real.Clamp(distance, minimum, maximum);
+        if (Real.IsFinite(target) && target != distance)
+            drawer.DrawSegment(second, second + normal * (target - distance), settings.CurrentColor);
+        drawer.DrawPoint(first, settings.PointRadius, settings.ReferenceColor);
+        drawer.DrawPoint(second, settings.PointRadius, settings.CurrentColor);
     }
 }

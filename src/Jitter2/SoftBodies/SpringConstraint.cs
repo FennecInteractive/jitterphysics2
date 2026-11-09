@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Jitter2.Dynamics;
@@ -14,9 +15,7 @@ using Jitter2.Unmanaged;
 namespace Jitter2.SoftBodies;
 
 /// <summary>
-/// Constrains two bodies to maintain a target distance between anchor points,
-/// applying spring-like forces. Removes one translational degree of freedom along
-/// the line connecting the anchors.
+/// Applies a spring force between two anchors to maintain a target distance.
 /// </summary>
 /// <remarks>
 /// This constraint is designed for soft body vertices, which act as mass points.
@@ -27,6 +26,9 @@ namespace Jitter2.SoftBodies;
 /// </remarks>
 public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
 {
+    /// <inheritdoc />
+    public override string ToString() => FormatDescription(nameof(SpringConstraint));
+
     /// <summary>
     /// Low-level data for the spring constraint, stored in unmanaged memory.
     /// </summary>
@@ -73,12 +75,18 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
     /// <param name="anchor1">Anchor point on the first rigid body, in world space.</param>
     /// <param name="anchor2">Anchor point on the second rigid body, in world space.</param>
     /// <remarks>
-    /// Computes local anchor offsets from the current body positions.
     /// Default values: <see cref="Softness"/> = <see cref="Constraint.DefaultLinearSoftness"/>, <see cref="Bias"/> = <see cref="Constraint.DefaultLinearBias"/>.
     /// The <see cref="TargetDistance"/> is set to the initial distance between the anchors.
     /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="anchor1"/> or <paramref name="anchor2"/> contains a non-finite value.
+    /// </exception>
     public void Initialize(JVector anchor1, JVector anchor2)
     {
+        VerifyNotZero();
+        ArgumentCheck.Finite(anchor1, nameof(anchor1));
+        ArgumentCheck.Finite(anchor2, nameof(anchor2));
+
         ref SpringData data = ref Data;
         ref RigidBodyData body1 = ref data.Body1.Data;
         ref RigidBodyData body2 = ref data.Body2.Data;
@@ -92,32 +100,66 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
     }
 
     /// <summary>
-    /// Sets the spring parameters using physical properties. This method calculates and sets
-    /// the <see cref="Softness"/> and <see cref="Bias"/> properties. It assumes that the mass
-    /// of the involved bodies and the timestep size does not change.
+    /// Sets <see cref="Softness"/> and <see cref="Bias"/> from a frequency and damping ratio.
     /// </summary>
+    /// <remarks>
+    /// Call again if the bodies' masses, translation locks, anchor direction, timestep, or
+    /// <see cref="World.SubstepCount"/> change.
+    /// When the anchors coincide, the calculation uses the translation direction in which
+    /// the bodies respond most easily to a force.
+    /// </remarks>
     /// <param name="frequency">The frequency in Hz.</param>
     /// <param name="damping">The damping ratio (0 = no damping, 1 = critical damping).</param>
-    /// <param name="dt">The timestep of the simulation.</param>
+    /// <param name="dt">The timestep passed to <see cref="World.Step(Real, bool)"/>.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="frequency"/> or <paramref name="dt"/> is less than or equal to zero,
+    /// when <paramref name="damping"/> is negative, or when any value is not finite.
+    /// </exception>
     public void SetSpringParameters(Real frequency, Real damping, Real dt)
     {
+        ArgumentCheck.Positive(frequency, nameof(frequency));
+        ArgumentCheck.NonNegative(damping, nameof(damping));
+        ArgumentCheck.Positive(dt, nameof(dt));
+
         ref SpringData data = ref Data;
         ref RigidBodyData body1 = ref data.Body1.Data;
         ref RigidBodyData body2 = ref data.Body2.Data;
 
-        Real effectiveMass = (Real)1.0 / (body1.InverseMass + body2.InverseMass);
+        JVector direction = body2.Position + data.LocalAnchor2 - body1.Position - data.LocalAnchor1;
+        Real distance = direction.Length();
+        Real inverseEffectiveMass;
+        if (distance > 0)
+        {
+            direction *= (Real)1.0 / distance;
+            inverseEffectiveMass = JVector.Multiply(direction, body1.InverseMassVector) * direction +
+                                   JVector.Multiply(direction, body2.InverseMassVector) * direction;
+        }
+        else
+        {
+            // An undefined direction does not imply infinite mass. For unrestricted bodies
+            // this recovers their scalar inverse mass; restricted bodies use a responsive axis.
+            inverseEffectiveMass = JVector.MaxAbs(body1.InverseMassVector + body2.InverseMassVector);
+        }
 
         Real omega = (Real)2.0 * MathR.PI * frequency;
-        Real d = (Real)2.0 * effectiveMass * damping * omega;
-        Real k = effectiveMass * omega * omega;
+        if (!(inverseEffectiveMass > 0))
+        {
+            data.Softness = 0;
+            data.BiasFactor = dt * omega / ((Real)2.0 * damping + dt * omega);
+            return;
+        }
+
+        Real effectiveMass = (Real)1.0 / inverseEffectiveMass;
+        Real dampingCoefficient = (Real)2.0 * effectiveMass * damping * omega;
+        Real springStiffness = effectiveMass * omega * omega;
 
         Real h = dt;
-        data.Softness = (Real)1.0 / (d + h * k);
-        data.BiasFactor = h * k * data.Softness;
+        data.Softness = (Real)1.0 / (dampingCoefficient + h * springStiffness);
+        data.BiasFactor = h * springStiffness * data.Softness;
     }
 
     /// <summary>
-    /// Gets the accumulated impulse applied by the spring.
+    /// Gets the accumulated solver impulse from the last solved substep.
     /// </summary>
     public Real Impulse
     {
@@ -135,6 +177,8 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
     {
         set
         {
+            DebugCheck.IsFinite(value, nameof(value));
+
             ref SpringData data = ref Data;
             ref RigidBodyData body1 = ref data.Body1.Data;
             JVector.Subtract(value, body1.Position, out data.LocalAnchor1);
@@ -155,6 +199,8 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
     {
         set
         {
+            DebugCheck.IsFinite(value, nameof(value));
+
             ref SpringData data = ref Data;
             ref RigidBodyData body2 = ref data.Body2.Data;
             JVector.Subtract(value, body2.Position, out data.LocalAnchor2);
@@ -176,6 +222,8 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
     {
         set
         {
+            DebugCheck.IsNonNegative(value, nameof(value));
+
             ref SpringData data = ref Data;
             data.Distance = value;
         }
@@ -206,8 +254,8 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
     /// Prepares the spring constraint for iteration.
     /// </summary>
     /// <param name="constraint">The constraint data reference.</param>
-    /// <param name="idt">The inverse substep duration (1/dt).</param>
-    public static void PrepareForIterationSpringConstraint(ref ConstraintData constraint, Real idt)
+    /// <param name="timeStep">The full step and substep timing information.</param>
+    public static void PrepareForIterationSpringConstraint(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, SpringData>(ref constraint);
         ref RigidBodyData body1 = ref data.Body1.Data;
@@ -221,33 +269,51 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
 
         JVector.Subtract(p2, p1, out JVector dp);
 
-        Real error = dp.Length() - data.Distance;
+        Real distance = dp.Length();
+        Real error = distance - data.Distance;
 
-        JVector n = p2 - p1;
-        if (n.LengthSquared() > (Real)1e-12) JVector.NormalizeInPlace(ref n);
+        if (distance == 0)
+        {
+            data.Jacobian = JVector.Zero;
+            data.EffectiveMass = data.AccumulatedImpulse = data.Bias = 0;
+            return;
+        }
+
+        JVector n = dp * ((Real)1.0 / distance);
 
         data.Jacobian = n;
-        data.EffectiveMass = body1.InverseMass + body2.InverseMass;
-        data.EffectiveMass += data.Softness * idt;
-        data.EffectiveMass = (Real)1.0 / data.EffectiveMass;
+        data.EffectiveMass = JVector.Multiply(n, body1.InverseMassVector) * n +
+                             JVector.Multiply(n, body2.InverseMassVector) * n;
+        data.EffectiveMass += data.Softness * timeStep.InverseSubstepDt;
+        data.EffectiveMass = data.EffectiveMass > 0 ? (Real)1.0 / data.EffectiveMass : 0;
+        if (data.EffectiveMass == 0) data.AccumulatedImpulse = 0;
 
-        data.Bias = error * data.BiasFactor * idt;
+        data.Bias = error * data.BiasFactor * timeStep.InverseStepDt;
 
-        body1.Velocity -= body1.InverseMass * data.AccumulatedImpulse * data.Jacobian;
-        body2.Velocity += body2.InverseMass * data.AccumulatedImpulse * data.Jacobian;
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity -= JVector.Multiply(data.AccumulatedImpulse * data.Jacobian, body1.InverseMassVector);
+        }
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(data.AccumulatedImpulse * data.Jacobian, body2.InverseMassVector);
+        }
     }
 
     /// <summary>
     /// Gets or sets the softness (compliance) of the spring constraint.
     /// </summary>
     /// <value>
-    /// Default is 0.001. Higher values allow more positional error but produce a softer spring.
-    /// Scaled by inverse timestep during solving.
+    /// Default is <see cref="Constraint.DefaultLinearSoftness"/>. Higher values allow more positional error but produce a softer spring.
     /// </value>
     public Real Softness
     {
         get => Data.Softness;
-        set => Data.Softness = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.Softness = value;
+        }
     }
 
     /// <summary>
@@ -259,15 +325,19 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
     public Real Bias
     {
         get => Data.BiasFactor;
-        set => Data.BiasFactor = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.BiasFactor = value;
+        }
     }
 
     /// <summary>
     /// Performs one iteration of the spring constraint solver.
     /// </summary>
     /// <param name="constraint">The constraint data reference.</param>
-    /// <param name="idt">The inverse substep duration (1/dt).</param>
-    public static void IterateSpringConstraint(ref ConstraintData constraint, Real idt)
+    /// <param name="timeStep">The full step and substep timing information.</param>
+    public static void IterateSpringConstraint(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, SpringData>(ref constraint);
         ref RigidBodyData body1 = ref constraint.Body1.Data;
@@ -275,7 +345,7 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
 
         Real jv = (body2.Velocity - body1.Velocity) * data.Jacobian;
 
-        Real softnessScalar = data.AccumulatedImpulse * data.Softness * idt;
+        Real softnessScalar = data.AccumulatedImpulse * data.Softness * timeStep.InverseSubstepDt;
 
         Real lambda = -data.EffectiveMass * (jv + data.Bias + softnessScalar);
 
@@ -283,24 +353,45 @@ public unsafe class SpringConstraint : Constraint<SpringConstraint.SpringData>
         data.AccumulatedImpulse += lambda;
         lambda = data.AccumulatedImpulse - oldAccumulatedImpulse;
 
-        body1.Velocity -= body1.InverseMass * lambda * data.Jacobian;
-        body2.Velocity += body2.InverseMass * lambda * data.Jacobian;
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity -= JVector.Multiply(lambda * data.Jacobian, body1.InverseMassVector);
+        }
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(lambda * data.Jacobian, body2.InverseMassVector);
+        }
     }
 
     /// <inheritdoc/>
-    public override void DebugDraw(IDebugDrawer drawer)
+    public override void DebugDraw(IDebugDrawer drawer) => DebugDraw(drawer, DebugDrawSettings.Default);
+
+    /// <inheritdoc />
+    public override void DebugDraw(IDebugDrawer drawer, in DebugDrawSettings settings)
     {
-        ref SpringData data = ref Data;
-        ref RigidBodyData body1 = ref data.Body1.Data;
-        ref RigidBodyData body2 = ref data.Body2.Data;
+        JVector reference = JVector.UnitX;
+        DebugDraw(drawer, ref reference, settings);
+    }
 
-        JVector p1 = body1.Position + data.LocalAnchor1;
-        JVector p2 = body2.Position + data.LocalAnchor2;
-
-        drawer.DrawSegment(body1.Position, p1);
-        drawer.DrawSegment(body2.Position, p2);
-        drawer.DrawSegment(p1, p2);
-        drawer.DrawPoint(p1);
-        drawer.DrawPoint(p2);
+    /// <summary>
+    /// Draws the spring with a caller-owned coil reference. Retain this direction between frames
+    /// to keep the coil continuous through arbitrary motion, including a reversal of the spring axis.
+    /// </summary>
+    public void DebugDraw(IDebugDrawer drawer, ref JVector reference, in DebugDrawSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(drawer);
+        VerifyNotZero();
+        JVector first = Anchor1, second = Anchor2;
+        JVector displacement = second - first;
+        drawer.DrawSpring(first, second, ref reference, settings.GuideSize * (Real)0.12, settings.CurrentColor,
+            Math.Max(32, settings.Segments * 2));
+        drawer.DrawPoint(first, settings.PointRadius, settings.ReferenceColor);
+        drawer.DrawPoint(second, settings.PointRadius, settings.CurrentColor);
+        if (displacement.LengthSquared() > (Real)1e-20)
+        {
+            JVector direction = JVector.Normalize(displacement);
+            drawer.DrawStop(first + direction * TargetDistance, direction,
+                settings.GuideSize * (Real)0.12, settings.ReferenceColor);
+        }
     }
 }

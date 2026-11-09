@@ -17,6 +17,12 @@ public class CylinderShape : RigidBodyShape
     private Real radius;
     private Real height;
 
+    /// <inheritdoc/>
+    protected internal override void DebugDrawLocal<TSink>(ref TSink triangleSink, in DebugDrawSettings settings)
+    {
+        ShapeDebugDraw.Cylinder(ref triangleSink, radius, height, settings.Segments);
+    }
+
     /// <summary>
     /// Gets or sets the radius of the cylinder.
     /// </summary>
@@ -28,8 +34,7 @@ public class CylinderShape : RigidBodyShape
         get => radius;
         set
         {
-            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, nameof(Radius));
-            radius = value;
+            radius = ArgumentCheck.Positive(value, nameof(Radius));
             UpdateWorldBoundingBox();
         }
     }
@@ -45,15 +50,13 @@ public class CylinderShape : RigidBodyShape
         get => height;
         set
         {
-            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, nameof(Height));
-            height = value;
+            height = ArgumentCheck.Positive(value, nameof(Height));
             UpdateWorldBoundingBox();
         }
     }
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="CylinderShape"/> class, creating a cylinder shape with the specified
-    /// height and radius. The symmetry axis of the cylinder is aligned along the y-axis.
+    /// Creates a cylinder with its symmetry axis along the local Y-axis.
     /// </summary>
     /// <param name="height">The height of the cylinder.</param>
     /// <param name="radius">The radius of the cylinder at its base.</param>
@@ -62,11 +65,8 @@ public class CylinderShape : RigidBodyShape
     /// </exception>
     public CylinderShape(Real height, Real radius)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(radius);
-
-        this.radius = radius;
-        this.height = height;
+        this.radius = ArgumentCheck.Positive(radius, nameof(radius));
+        this.height = ArgumentCheck.Positive(height, nameof(height));
         UpdateWorldBoundingBox();
     }
 
@@ -79,7 +79,7 @@ public class CylinderShape : RigidBodyShape
     /// <inheritdoc/>
     public override void SupportMap(in JVector direction, out JVector result)
     {
-        Real sigma = (Real)Math.Sqrt(direction.X * direction.X + direction.Z * direction.Z);
+        Real sigma = MathR.Sqrt(direction.X * direction.X + direction.Z * direction.Z);
 
         if (sigma > (Real)0.0)
         {
@@ -93,6 +93,48 @@ public class CylinderShape : RigidBodyShape
             result.Y = Math.Sign(direction.Y) * height * (Real)0.5;
             result.Z = (Real)0.0;
         }
+    }
+
+    private const Real Sqrt1Over2 = (Real)0.70710678118654752;
+
+    // Unit circle in the XZ plane, eight points in winding order.
+    private static readonly Real[] rim = [(Real)1.0, (Real)0.0, Sqrt1Over2, Sqrt1Over2, (Real)0.0, (Real)1.0,
+        -Sqrt1Over2, Sqrt1Over2, -(Real)1.0, (Real)0.0, -Sqrt1Over2, -Sqrt1Over2, (Real)0.0, -(Real)1.0,
+        Sqrt1Over2, -Sqrt1Over2];
+
+    /// <inheritdoc/>
+    public override int SupportFeature(in JVector direction, Real tolerance, Span<JVector> vertices)
+    {
+        Real sideSq = direction.X * direction.X + direction.Z * direction.Z;
+        Real toleranceSq = tolerance * tolerance * direction.LengthSquared();
+        Real halfHeight = height * (Real)0.5;
+
+        // Almost perpendicular to the axis, the cylinder rests on the line of its side that faces
+        // the direction.
+        if (sideSq > (Real)0.0 && direction.Y * direction.Y < toleranceSq)
+        {
+            Real scale = radius / MathR.Sqrt(sideSq);
+            vertices[0] = new JVector(direction.X * scale, halfHeight, direction.Z * scale);
+            vertices[1] = new JVector(direction.X * scale, -halfHeight, direction.Z * scale);
+            return 2;
+        }
+
+        // Almost along the axis, it stands on a cap, approximated by an octagon on its rim.
+        if (sideSq < toleranceSq)
+        {
+            Real capY = Math.Sign(direction.Y) * halfHeight;
+
+            for (int i = 0; i < 8; i++)
+            {
+                vertices[i] = new JVector(rim[2 * i] * radius, capY, rim[2 * i + 1] * radius);
+            }
+
+            return 8;
+        }
+
+        // Otherwise it touches at a single point of a rim.
+        SupportMap(direction, out vertices[0]);
+        return 1;
     }
 
     /// <inheritdoc/>
@@ -118,11 +160,11 @@ public class CylinderShape : RigidBodyShape
     }
 
     /// <inheritdoc/>
-    public override void CalculateMassInertia(out JMatrix inertia, out JVector com, out Real mass)
+    public override void CalculateMassInertia(out JSymmetricMatrix inertia, out JVector com, out Real mass)
     {
         mass = MathR.PI * radius * radius * height;
 
-        inertia = JMatrix.Identity;
+        inertia = JSymmetricMatrix.Identity;
 
         inertia.M11 = (Real)(1.0 / 4.0) * mass * radius * radius + (Real)(1.0 / 12.0) * mass * height * height;
         inertia.M22 = (Real)(1.0 / 2.0) * mass * radius * radius;

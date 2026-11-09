@@ -13,12 +13,14 @@ using Jitter2.Unmanaged;
 namespace Jitter2.Dynamics.Constraints;
 
 /// <summary>
-/// Constrains the distance between a fixed point in the reference frame of one body and a fixed
-/// point in the reference frame of another body. This constraint removes one translational degree
-/// of freedom. For a distance of zero, use the <see cref="BallSocket"/> constraint.
+/// Keeps the distance between two body anchors within a range, or at a fixed value.
+/// For a fixed distance of zero, use <see cref="BallSocket"/>.
 /// </summary>
 public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
 {
+    /// <inheritdoc />
+    public override string ToString() => FormatDescription(nameof(DistanceLimit));
+
     [StructLayout(LayoutKind.Sequential)]
     public struct DistanceLimitData
     {
@@ -49,7 +51,7 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
     }
 
     private static readonly uint RegisteredDispatchId =
-        RegisterFullConstraint(&PrepareForIterationFixedAngle, &IterateFixedAngle);
+        RegisterFullConstraint(&PrepareForIterationDistanceLimit, &IterateDistanceLimit);
 
 
     protected override void Create()
@@ -66,6 +68,9 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
     /// </summary>
     /// <param name="anchor1">Anchor point on the first body in world space.</param>
     /// <param name="anchor2">Anchor point on the second body in world space.</param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="anchor1"/> or <paramref name="anchor2"/> contains a non-finite value.
+    /// </exception>
     public void Initialize(JVector anchor1, JVector anchor2)
     {
         Initialize(anchor1, anchor2, LinearLimit.Fixed);
@@ -76,14 +81,24 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
     /// </summary>
     /// <param name="anchor1">Anchor point on the first body in world space.</param>
     /// <param name="anchor2">Anchor point on the second body in world space.</param>
-    /// <param name="limit">The allowed distance range between anchor points.</param>
+    /// <param name="limit">Allowed offsets from the initial distance between anchor points.
+    /// For example, a limit of (-1, 1) allows the distance to change by at most one unit in either direction.</param>
     /// <remarks>
-    /// Computes local anchor points and the initial distance from current poses.
+    /// Equal or reversed limits fix the distance offset at their midpoint.
     /// Default values: <see cref="Softness"/> = <see cref="Constraint.DefaultLinearSoftness"/>, <see cref="Bias"/> = <see cref="Constraint.DefaultLinearBias"/>.
     /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="anchor1"/> or <paramref name="anchor2"/> contains a non-finite value,
+    /// or when either value in <paramref name="limit"/> is NaN.
+    /// </exception>
     public void Initialize(JVector anchor1, JVector anchor2, LinearLimit limit)
     {
         VerifyNotZero();
+        ArgumentCheck.Finite(anchor1, nameof(anchor1));
+        ArgumentCheck.Finite(anchor2, nameof(anchor2));
+        ArgumentCheck.NotNaN(limit.From, nameof(limit.From));
+        ArgumentCheck.NotNaN(limit.To, nameof(limit.To));
+
         ref DistanceLimitData data = ref Data;
         ref RigidBodyData body1 = ref data.Body1.Data;
         ref RigidBodyData body2 = ref data.Body2.Data;
@@ -110,6 +125,8 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
     {
         set
         {
+            DebugCheck.IsFinite(value, nameof(value));
+
             ref DistanceLimitData data = ref Data;
             ref RigidBodyData body1 = ref data.Body1.Data;
             JVector.Subtract(value, body1.Position, out data.LocalAnchor1);
@@ -134,6 +151,8 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
     {
         set
         {
+            DebugCheck.IsFinite(value, nameof(value));
+
             ref DistanceLimitData data = ref Data;
             ref RigidBodyData body2 = ref data.Body2.Data;
             JVector.Subtract(value, body2.Position, out data.LocalAnchor2);
@@ -157,6 +176,8 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
     {
         set
         {
+            DebugCheck.IsNonNegative(value, nameof(value));
+
             ref DistanceLimitData data = ref Data;
             data.Distance = value;
         }
@@ -186,7 +207,7 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
         }
     }
 
-    public static void PrepareForIterationFixedAngle(ref ConstraintData constraint, Real idt)
+    public static void PrepareForIterationDistanceLimit(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, DistanceLimitData>(ref constraint);
         ref RigidBodyData body1 = ref data.Body1.Data;
@@ -200,16 +221,22 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
 
         JVector.Subtract(p2, p1, out JVector dp);
 
-        Real error = dp.Length() - data.Distance;
+        Real distance = dp.Length();
+        Real error = distance - data.Distance;
 
         data.Clamp = 0;
 
-        if (error >= data.LimitMax)
+        if (data.LimitMin >= data.LimitMax)
+        {
+            error -= (Real)0.5 * data.LimitMin + (Real)0.5 * data.LimitMax;
+            data.Clamp = 3;
+        }
+        else if (error >= data.LimitMax)
         {
             data.Clamp = 1;
             error -= data.LimitMax;
         }
-        else if (error < data.LimitMin)
+        else if (error <= data.LimitMin)
         {
             data.Clamp = 2;
             error -= data.LimitMin;
@@ -220,8 +247,16 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
             return;
         }
 
-        JVector n = p2 - p1;
-        if (n.LengthSquared() > (Real)1e-12) JVector.NormalizeInPlace(ref n);
+        // A distance constraint has no direction at exactly coincident anchors.
+        // Every nonzero separation needs a unit Jacobian, including tiny distances.
+        if (distance == 0)
+        {
+            data.Clamp = 0;
+            data.AccumulatedImpulse = 0;
+            return;
+        }
+
+        JVector n = dp * ((Real)1.0 / distance);
 
         var jacobian = new Span<JVector>(Unsafe.AsPointer(ref data.J0), 4);
 
@@ -230,54 +265,69 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
         jacobian[2] = (Real)1.0 * n;
         jacobian[3] = r2 % n;
 
-        data.EffectiveMass = body1.InverseMass +
-                             body2.InverseMass +
+        data.EffectiveMass = JVector.Multiply(jacobian[0], body1.InverseMassVector) * jacobian[0] +
+                             JVector.Multiply(jacobian[2], body2.InverseMassVector) * jacobian[2] +
                              JVector.Transform(jacobian[1], body1.InverseInertiaWorld) * jacobian[1] +
                              JVector.Transform(jacobian[3], body2.InverseInertiaWorld) * jacobian[3];
 
-        data.EffectiveMass += data.Softness * idt;
+        data.EffectiveMass += data.Softness * timeStep.InverseSubstepDt;
 
-        data.EffectiveMass = (Real)1.0 / data.EffectiveMass;
+        data.EffectiveMass = data.EffectiveMass > 0 ? (Real)1.0 / data.EffectiveMass : 0;
+        if (data.EffectiveMass == 0) data.AccumulatedImpulse = 0;
 
-        data.Bias = error * data.BiasFactor * idt;
+        data.Bias = error * data.BiasFactor * timeStep.InverseStepDt;
 
-        body1.Velocity += body1.InverseMass * data.AccumulatedImpulse * jacobian[0];
-        body1.AngularVelocity += JVector.Transform(data.AccumulatedImpulse * jacobian[1], body1.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity += JVector.Multiply(data.AccumulatedImpulse * jacobian[0], body1.InverseMassVector);
+            body1.AngularVelocity += JVector.Transform(data.AccumulatedImpulse * jacobian[1], body1.InverseInertiaWorld);
+        }
 
-        body2.Velocity += body2.InverseMass * data.AccumulatedImpulse * jacobian[2];
-        body2.AngularVelocity += JVector.Transform(data.AccumulatedImpulse * jacobian[3], body2.InverseInertiaWorld);
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(data.AccumulatedImpulse * jacobian[2], body2.InverseMassVector);
+            body2.AngularVelocity += JVector.Transform(data.AccumulatedImpulse * jacobian[3], body2.InverseInertiaWorld);
+        }
     }
 
     /// <summary>
     /// Gets or sets the softness (compliance) of the constraint.
     /// </summary>
     /// <value>
-    /// Default is 0.001. Higher values allow more distance error but improve stability.
+    /// Default is <see cref="Constraint.DefaultLinearSoftness"/>. Higher values allow more distance error but improve stability.
     /// </value>
     public Real Softness
     {
         get => Data.Softness;
-        set => Data.Softness = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.Softness = value;
+        }
     }
 
     /// <summary>
     /// Gets or sets the bias factor controlling how aggressively distance error is corrected.
     /// </summary>
     /// <value>
-    /// Default is 0.2. Range [0, 1]. Higher values correct errors faster but may cause instability.
+    /// Default is 0.2. Higher values correct errors faster but may cause instability.
     /// </value>
     public Real Bias
     {
         get => Data.BiasFactor;
-        set => Data.BiasFactor = value;
+        set
+        {
+            DebugCheck.IsNonNegative(value, nameof(value));
+            Data.BiasFactor = value;
+        }
     }
 
     /// <summary>
-    /// Gets the accumulated impulse applied by this constraint during the last step.
+    /// Gets the accumulated solver impulse from the last solved substep.
     /// </summary>
     public Real Impulse => Data.AccumulatedImpulse;
 
-    public static void IterateFixedAngle(ref ConstraintData constraint, Real idt)
+    public static void IterateDistanceLimit(ref ConstraintData constraint, in TimeStep timeStep)
     {
         ref var data = ref Unsafe.As<ConstraintData, DistanceLimitData>(ref constraint);
         ref RigidBodyData body1 = ref constraint.Body1.Data;
@@ -293,7 +343,7 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
             body2.Velocity * jacobian[2] +
             body2.AngularVelocity * jacobian[3];
 
-        Real softnessScalar = data.AccumulatedImpulse * data.Softness * idt;
+        Real softnessScalar = data.AccumulatedImpulse * data.Softness * timeStep.InverseSubstepDt;
 
         Real lambda = -data.EffectiveMass * (jv + data.Bias + softnessScalar);
 
@@ -305,36 +355,53 @@ public unsafe class DistanceLimit : Constraint<DistanceLimit.DistanceLimitData>
         {
             data.AccumulatedImpulse = MathR.Min(data.AccumulatedImpulse, (Real)0.0);
         }
-        else
+        else if (data.Clamp == 2)
         {
             data.AccumulatedImpulse = MathR.Max(data.AccumulatedImpulse, (Real)0.0);
         }
 
         lambda = data.AccumulatedImpulse - oldAccumulated;
 
-        body1.Velocity += body1.InverseMass * lambda * jacobian[0];
-        body1.AngularVelocity += JVector.Transform(lambda * jacobian[1], body1.InverseInertiaWorld);
+        if (body1.MotionType == MotionType.Dynamic)
+        {
+            body1.Velocity += JVector.Multiply(lambda * jacobian[0], body1.InverseMassVector);
+            body1.AngularVelocity += JVector.Transform(lambda * jacobian[1], body1.InverseInertiaWorld);
+        }
 
-        body2.Velocity += body2.InverseMass * lambda * jacobian[2];
-        body2.AngularVelocity += JVector.Transform(lambda * jacobian[3], body2.InverseInertiaWorld);
+        if (body2.MotionType == MotionType.Dynamic)
+        {
+            body2.Velocity += JVector.Multiply(lambda * jacobian[2], body2.InverseMassVector);
+            body2.AngularVelocity += JVector.Transform(lambda * jacobian[3], body2.InverseInertiaWorld);
+        }
     }
 
-    public override void DebugDraw(IDebugDrawer drawer)
+    public override void DebugDraw(IDebugDrawer drawer) => DebugDraw(drawer, DebugDrawSettings.Default);
+
+    /// <inheritdoc />
+    public override void DebugDraw(IDebugDrawer drawer, in DebugDrawSettings settings)
     {
+        ArgumentNullException.ThrowIfNull(drawer);
+        VerifyNotZero();
         ref DistanceLimitData data = ref Data;
-        ref RigidBodyData body1 = ref data.Body1.Data;
-        ref RigidBodyData body2 = ref data.Body2.Data;
-
-        JVector.Transform(data.LocalAnchor1, body1.Orientation, out JVector r1);
-        JVector.Transform(data.LocalAnchor2, body2.Orientation, out JVector r2);
-
-        JVector p1 = body1.Position + r1;
-        JVector p2 = body2.Position + r2;
-
-        drawer.DrawSegment(body1.Position, p1);
-        drawer.DrawSegment(body2.Position, p2);
-        drawer.DrawSegment(p1, p2);
-        drawer.DrawPoint(p1);
-        drawer.DrawPoint(p2);
+        JVector first = Anchor1, second = Anchor2;
+        if (Body1 != Body1.World.NullBody) drawer.DrawSegment(Body1.Position, first, settings.ReferenceColor);
+        if (Body2 != Body2.World.NullBody) drawer.DrawSegment(Body2.Position, second, settings.CurrentColor);
+        drawer.DrawSegment(first, second, settings.CurrentColor);
+        drawer.DrawPoint(first, settings.PointRadius, settings.ReferenceColor);
+        drawer.DrawPoint(second, settings.PointRadius, settings.CurrentColor);
+        if (data.LimitMin >= data.LimitMax)
+        {
+            Real radius = data.Distance + data.LimitMin * (Real)0.5 + data.LimitMax * (Real)0.5;
+            if (Real.IsFinite(radius) && radius >= 0)
+                drawer.DrawSphere(first, radius, settings.UpperLimitColor, settings.Segments);
+        }
+        else
+        {
+            Real minimum = data.Distance + data.LimitMin, maximum = data.Distance + data.LimitMax;
+            if (Real.IsFinite(minimum) && minimum > 0)
+                drawer.DrawSphere(first, minimum, settings.LowerLimitColor, settings.Segments);
+            if (Real.IsFinite(maximum) && maximum >= 0)
+                drawer.DrawSphere(first, maximum, settings.UpperLimitColor, settings.Segments);
+        }
     }
 }

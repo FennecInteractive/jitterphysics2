@@ -28,7 +28,7 @@ public class Dragon : TriangleMeshDrawable
     }
 }
 
-public struct CollisionTriangle : ISupportMappable
+public struct CollisionTriangle : ISupportFeature
 {
     public JVector A, B, C;
 
@@ -54,6 +54,26 @@ public struct CollisionTriangle : ISupportMappable
     public void GetCenter(out JVector point)
     {
         point = (1.0f / 3.0f) * (A + B + C);
+    }
+
+    // A vertex belongs to the feature if tilting the direction by the tolerance angle can make it
+    // as high as the highest vertex: the whole triangle near its normal, an edge near the edge's
+    // normals, otherwise the single vertex.
+    public int SupportFeature(in JVector direction, float tolerance, Span<JVector> vertices)
+    {
+        float a = JVector.Dot(A, direction);
+        float b = JVector.Dot(B, direction);
+        float c = JVector.Dot(C, direction);
+
+        float max = MathF.Max(a, MathF.Max(b, c));
+        JVector top = a == max ? A : b == max ? B : C;
+        float slack = tolerance * direction.Length();
+
+        int count = 0;
+        if (max - a <= slack * (A - top).Length()) vertices[count++] = A;
+        if (max - b <= slack * (B - top).Length()) vertices[count++] = B;
+        if (max - c <= slack * (C - top).Length()) vertices[count++] = C;
+        return count;
     }
 }
 
@@ -138,7 +158,7 @@ public class Tester(Octree tree) : IDynamicTreeProxy, IRayCastable
     }
 }
 
-public class Demo20 : IDemo, ICleanDemo, IDrawUpdate
+public class Demo20 : IDemo
 {
     public string Name => "Octree (Custom Collision)";
     public string Description => "High-poly mesh in an octree with custom narrow-phase triangle collision.";
@@ -148,10 +168,10 @@ public class Demo20 : IDemo, ICleanDemo, IDrawUpdate
 
     private Tester testShape = null!;
 
-    public void Build(Playground pg, World world)
+    public void Build(Playground pg)
     {
         this.pg = pg;
-        this.world = world;
+        world = pg.World;
 
         pg.AddFloor();
 

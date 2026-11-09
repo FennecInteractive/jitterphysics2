@@ -5,9 +5,9 @@
  */
 
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using Jitter2.Collision;
 using Jitter2.Collision.Shapes;
@@ -22,8 +22,47 @@ using Jitter2.Unmanaged;
 namespace Jitter2;
 
 /// <summary>
-/// Represents a simulation environment that holds and manages the state of all simulation objects.
+/// Thrown when two body arguments are required to reference different bodies.
 /// </summary>
+public sealed class SameBodyException : ArgumentException
+{
+    private const string DefaultMessage = "Body arguments must be different.";
+    private const string DefaultParamName = "body2";
+
+    public SameBodyException()
+        : base(DefaultMessage, DefaultParamName)
+    {
+    }
+
+    public SameBodyException(string message)
+        : base(message)
+    {
+    }
+
+    public SameBodyException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
+
+    public SameBodyException(string message, string paramName)
+        : base(message, paramName)
+    {
+    }
+
+    public SameBodyException(string message, string paramName, Exception innerException)
+        : base(message, paramName, innerException)
+    {
+    }
+}
+
+/// <summary>
+/// Contains the bodies, contacts, and constraints of a physics simulation.
+/// </summary>
+/// <remarks>
+/// Do not step or modify the same world from multiple threads at once. Different worlds can
+/// run concurrently with <c>multiThread: false</c>. Multithreaded steps share a worker pool
+/// and wait for each other, even when they belong to different worlds.
+/// </remarks>
 public sealed partial class World : IDisposable
 {
     /// <summary>
@@ -44,13 +83,12 @@ public sealed partial class World : IDisposable
     }
 
     /// <summary>
-    /// Provides access to objects in unmanaged memory. This operation is potentially unsafe.
+    /// Provides direct access to body, contact, and constraint data stored in unmanaged memory.
     /// </summary>
     /// <remarks>
-    /// The returned spans are backed by unmanaged memory and are only valid until the next
-    /// world modification that may resize internal buffers (e.g., creating or removing bodies,
-    /// constraints, contacts, or calling <see cref="Step"/>). Do not cache these spans.
-    /// Not safe to use concurrently with <see cref="Step(Real, bool)"/>.
+    /// Do not retain spans across calls to <see cref="Step(Real, bool)"/> or changes to bodies,
+    /// contacts, or constraints: these operations can move or resize the underlying storage.
+    /// Do not access the spans while the world is being stepped.
     /// </remarks>
     public readonly struct SpanData(World world)
     {
@@ -108,22 +146,18 @@ public sealed partial class World : IDisposable
     /// <summary>
     /// Delegate for per-step and per-substep callbacks.
     /// </summary>
-    /// <param name="dt">
-    /// The duration in seconds: the full step duration for <see cref="PreStep"/>/<see cref="PostStep"/>,
-    /// or the substep duration for <see cref="PreSubStep"/>/<see cref="PostSubStep"/>.
-    /// </param>
-    public delegate void WorldStep(Real dt);
+    /// <param name="timeStep">The full step and substep timing information.</param>
+    public delegate void WorldStep(TimeStep timeStep);
 
-    // Post- and Pre-step
+    // Step callbacks.
 
     /// <summary>
     /// Raised at the beginning of a simulation step, before any collision detection,
     /// constraint solving, or integration is performed.
     /// </summary>
     /// <remarks>
-    /// This event is invoked once per call to <see cref="Step"/> and receives the full
-    /// step time <c>dt</c>. It can be used to apply external forces, modify bodies,
-    /// or gather per-step diagnostics before the simulation advances.
+    /// Use this event to apply forces or update bodies before the simulation advances.
+    /// It runs once per call to <see cref="Step"/>, on the calling thread.
     /// </remarks>
     [CallbackThread(ThreadContext.MainThread)]
     public event WorldStep? PreStep;
@@ -133,9 +167,8 @@ public sealed partial class World : IDisposable
     /// and integration have completed.
     /// </summary>
     /// <remarks>
-    /// This event is invoked once per call to <see cref="Step"/> and receives the full
-    /// step time <c>dt</c>. At this point, all body states represent the final results
-    /// of the step.
+    /// Body states contain the completed step's results. This event runs once per call
+    /// to <see cref="Step"/>, on the calling thread.
     /// </remarks>
     [CallbackThread(ThreadContext.MainThread)]
     public event WorldStep? PostStep;
@@ -144,13 +177,9 @@ public sealed partial class World : IDisposable
     /// Raised at the beginning of each substep during a simulation step.
     /// </summary>
     /// <remarks>
-    /// A simulation step may be divided into multiple substeps for stability.
-    /// This event is invoked once per substep and receives the substep duration
-    /// (<c>dt / substepCount</c>). It is called immediately before force integration
-    /// and constraint solving for the substep.
-    /// Do not perform topology-changing world modifications here (for example
-    /// adding or removing bodies, constraints, or contacts, or changing body
-    /// motion types).
+    /// Runs on the calling thread, before forces are applied and constraints are solved.
+    /// Do not add or remove bodies, shapes, constraints, or contacts, or change body motion types
+    /// in this callback.
     /// </remarks>
     [CallbackThread(ThreadContext.MainThread)]
     public event WorldStep? PreSubStep;
@@ -159,27 +188,78 @@ public sealed partial class World : IDisposable
     /// Raised at the end of each substep during a simulation step.
     /// </summary>
     /// <remarks>
-    /// This event is invoked once per substep and receives the substep duration.
-    /// It is called after integration and constraint solving for the substep
-    /// have completed.
-    /// Do not perform topology-changing world modifications here (for example
-    /// adding or removing bodies, constraints, or contacts, or changing body
-    /// motion types).
+    /// Runs on the calling thread, after bodies have moved and constraints have been solved.
+    /// Do not add or remove bodies, shapes, constraints, or contacts, or change body motion types
+    /// in this callback.
     /// </remarks>
     [CallbackThread(ThreadContext.MainThread)]
     public event WorldStep? PostSubStep;
 
     /// <summary>
-    /// Grants access to objects residing in unmanaged memory. This operation can be potentially unsafe. Use
-    /// the corresponding managed properties where possible to mitigate risk.
+    /// Raised when a group of connected bodies wakes up.
     /// </summary>
-    public SpanData RawData => new(this);
+    /// <remarks>
+    /// The bodies are already awake when this callback runs. Islands can split, merge, or be
+    /// reused, so copy any data you need instead of retaining the island reference.
+    /// Do not add or remove bodies, shapes, constraints, or contacts, or change body motion types
+    /// in this callback.
+    /// </remarks>
+    [CallbackThread(ThreadContext.MainThread)]
+    public event Action<Island>? IslandActivated;
+
+    /// <summary>
+    /// Raised when a group of connected bodies goes to sleep.
+    /// </summary>
+    /// <remarks>
+    /// The bodies are already asleep when this callback runs. Islands can split, merge, or be
+    /// reused, so copy any data you need instead of retaining the island reference.
+    /// Do not add or remove bodies, shapes, constraints, or contacts, or change body motion types
+    /// in this callback.
+    /// </remarks>
+    [CallbackThread(ThreadContext.MainThread)]
+    public event Action<Island>? IslandDeactivated;
+
+    /// <summary>
+    /// Raised after a constraint has been permanently removed from the world.
+    /// </summary>
+    /// <remarks>
+    /// The event is raised for explicit removal as well as automatic removal caused by removing a
+    /// body or clearing the world. It is not raised when a constraint is disabled, when a body's
+    /// motion type changes, or when the world is disposed.
+    /// The constraint is invalid when the callback runs, but its <see cref="Constraint.Body1"/> and
+    /// <see cref="Constraint.Body2"/> references remain available.
+    /// </remarks>
+    [CallbackThread(ThreadContext.MainThread)]
+    public event Action<Constraint>? ConstraintRemoved;
+
+    /// <summary>
+    /// Provides direct access to the world's unmanaged simulation data. Prefer the properties on
+    /// <see cref="RigidBody"/>, <see cref="Constraint"/>, and <see cref="Arbiter"/> for normal use.
+    /// </summary>
+    /// <remarks>
+    /// Spans must not be retained across world changes or accessed while the world is being stepped.
+    /// See <see cref="SpanData"/> for lifetime restrictions.
+    /// </remarks>
+    /// <exception cref="ObjectDisposedException">Thrown if this world has been disposed.</exception>
+    public SpanData RawData
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return new SpanData(this);
+        }
+    }
 
     private readonly ShardedDictionary<ArbiterKey, Arbiter> arbiters =
         new(Parallelization.ThreadPool.ThreadCountSuggestion);
 
+    // Accessed under lock (memContacts) during creation/rollback. Removal is exclusive:
+    // either during Step after collision workers finish, or between simulation steps.
+    private readonly Stack<Arbiter> arbiterPool = [];
+
     private readonly PartitionedSet<Island> islands = [];
     private readonly PartitionedSet<RigidBody> bodies = [];
+    private readonly Stack<Island> islandPool = [];
 
     private static ulong _idCounter;
 
@@ -201,7 +281,7 @@ public sealed partial class World : IDisposable
     /// <exception cref="ArgumentOutOfRangeException">Thrown when count is less than 1.</exception>
     public static (ulong min, ulong max) RequestId(int count)
     {
-        if (count < 1) throw new ArgumentOutOfRangeException(nameof(count), "Count must be greater zero.");
+        if (count < 1) throw new ArgumentOutOfRangeException(nameof(count), "Count must be greater than zero.");
         ulong count64 = (ulong)count;
         ulong max = Interlocked.Add(ref _idCounter, count64) + 1;
         return (max - count64, max);
@@ -210,7 +290,24 @@ public sealed partial class World : IDisposable
     /// <summary>
     /// Gets or sets the threading model used between calls to <see cref="Step(Real, bool)"/>.
     /// </summary>
-    public ThreadModelType ThreadModel { get; set; } = ThreadModelType.Regular;
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when an undefined <see cref="ThreadModelType"/>
+    /// value is assigned.</exception>
+    public ThreadModelType ThreadModel
+    {
+        get => threadModel;
+        set
+        {
+            if (!Enum.IsDefined(value))
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value,
+                    "The thread model must be a defined enum value.");
+            }
+
+            threadModel = value;
+        }
+    }
+
+    private ThreadModelType threadModel = ThreadModelType.Regular;
 
     /// <summary>
     /// All collision islands in this world.
@@ -223,31 +320,54 @@ public sealed partial class World : IDisposable
     public ReadOnlyPartitionedSet<RigidBody> RigidBodies => new(bodies);
 
     /// <summary>
-    /// Access to the <see cref="DynamicTree"/> instance. The instance
-    /// should only be modified by Jitter.
+    /// The broad phase of this world. It holds a proxy for every shape attached to a body, and can also
+    /// hold proxies added by the application. Update a shape's proxy after changing its geometry.
     /// </summary>
     public DynamicTree DynamicTree { get; }
 
     /// <summary>
-    /// A fixed body, pinned to the world. Can be used to create constraints with.
+    /// A static body to use as one endpoint when attaching a constraint to the world.
     /// </summary>
     public RigidBody NullBody { get; }
 
     /// <summary>
-    /// Specifies whether the deactivation mechanism of Jitter is enabled.
-    /// Does not activate inactive objects if set to false.
+    /// Whether bodies can go to sleep when they stop moving. Default is true.
+    /// Setting this to false does not wake bodies that are already asleep.
     /// </summary>
     public bool AllowDeactivation { get; set; } = true;
+
+    private unsafe ContactSettings* contactSettings;
+
+    /// <summary>
+    /// Solver settings shared by all contacts of this world, such as the penetration correction and the
+    /// restitution threshold. Modify the fields in place; every contact reads them when it is prepared.
+    /// </summary>
+    /// <remarks>
+    /// The settings live in unmanaged memory owned by the world. Do not keep the reference across a
+    /// <see cref="Dispose"/> call.
+    /// </remarks>
+    /// <exception cref="ObjectDisposedException">Thrown if this world has been disposed.</exception>
+    public unsafe ref ContactSettings ContactSettings
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return ref *contactSettings;
+        }
+    }
+
+    internal unsafe ContactSettings* ContactSettingsPointer => contactSettings;
 
     /// <summary>
     /// Gets or sets the number of iterations per substep for the constraint solver and velocity relaxation.
     /// </summary>
     /// <remarks>
     /// Higher solver iterations improve constraint accuracy at the cost of performance.
-    /// Relaxation iterations help reduce velocity errors after solving.
+    /// Relaxation iterations solve the contacts again after the bodies have moved, this time without
+    /// pushing overlapping bodies apart, so that the push does not remain as extra velocity.
     /// Default value: (solver: 6, relaxation: 4).
     /// </remarks>
-    /// <exception cref="ArgumentException">
+    /// <exception cref="ArgumentOutOfRangeException">
     /// Thrown if <c>solver</c> is less than 1 or <c>relaxation</c> is negative.
     /// </exception>
     public (int solver, int relaxation) SolverIterations
@@ -257,14 +377,16 @@ public sealed partial class World : IDisposable
         {
             if (value.solver < 1)
             {
-                throw new ArgumentException("Solver iterations can not be smaller than one.",
-                    nameof(SolverIterations));
+                throw new ArgumentOutOfRangeException(
+                    nameof(value.solver), value.solver,
+                    "Solver iterations cannot be smaller than one.");
             }
 
             if (value.relaxation < 0)
             {
-                throw new ArgumentException("Relaxation iterations can not be smaller than zero.",
-                    nameof(SolverIterations));
+                throw new ArgumentOutOfRangeException(
+                    nameof(value.relaxation), value.relaxation,
+                    "Relaxation iterations cannot be smaller than zero.");
             }
 
             solverIterations = value.solver;
@@ -277,6 +399,9 @@ public sealed partial class World : IDisposable
     /// Sub-stepping is deactivated when set to one.
     /// Default value: 1.
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when the assigned value is less than one.
+    /// </exception>
     public int SubstepCount
     {
         get => substeps;
@@ -285,7 +410,7 @@ public sealed partial class World : IDisposable
             if (value < 1)
             {
                 throw new ArgumentOutOfRangeException(nameof(value),
-                    "The number of substeps has to be larger than zero.");
+                    "The number of substeps must be greater than zero.");
             }
 
             substeps = value;
@@ -296,29 +421,46 @@ public sealed partial class World : IDisposable
     /// Default gravity, see also <see cref="RigidBody.AffectedByGravity"/>.
     /// Default value: (0, -9.81, 0).
     /// </summary>
-    public JVector Gravity { get; set; } = new(0, -(Real)9.81, 0);
+    public JVector Gravity
+    {
+        get => gravity;
+        set
+        {
+            DebugCheck.IsFinite(value, nameof(value));
+            gravity = value;
+        }
+    }
 
     // Make this global since it is used by nearly every method called
     // in World.Step.
+    private JVector gravity = new(0, -(Real)9.81, 0);
     private int solverIterations = 6;
     private int velocityRelaxations = 4;
     private int substeps = 1;
 
-    private Real stepDt = (Real)0.01;
-    private Real substepDt = (Real)0.01;
-    private Real invStepDt = (Real)100.0;
+    private TimeStep timeStep = new((Real)0.01);
+    // The dt used by the last broadphase update; before the first Step, allow a conservative sweep.
+    private Real broadphaseStepDt = (Real)0.1;
+
+    internal Real BroadphaseStepDt => broadphaseStepDt;
 
     /// <summary>
     /// Creates an instance of the World class.
     /// </summary>
-    public World()
+    public unsafe World()
     {
+        Debug.Assert(Unsafe.SizeOf<RigidBodyData>() == SolverPrefetchCacheLineSize * (Precision.IsDoublePrecision ? 4 : 2),
+            "RigidBodyData size should match the cache lines prefetched by the solver.");
+
         Logger.Information($"Creating new world.");
 
         memRigidBodies = new PartitionedBuffer<RigidBodyData>(aligned64: true);
         memContacts = new PartitionedBuffer<ContactData>();
         memConstraints = new PartitionedBuffer<ConstraintData>();
         memSmallConstraints = new PartitionedBuffer<SmallConstraintData>();
+
+        contactSettings = MemoryHelper.AllocateHeap<ContactSettings>(1);
+        *contactSettings = ContactSettings.Default;
 
         NullBody = CreateRigidBody();
         NullBody.MotionType = MotionType.Static;
@@ -329,8 +471,8 @@ public sealed partial class World : IDisposable
     }
 
     /// <summary>
-    /// Default filter function for the DynamicTree. Returns true if both proxies are of type RigidBodyShape
-    /// and belong to different RigidBody instances.
+    /// Default filter function for the DynamicTree. Rejects two <see cref="RigidBodyShape"/> proxies
+    /// attached to the same body; accepts other proxy pairs.
     /// </summary>
     public static bool DefaultDynamicTreeFilter(IDynamicTreeProxy proxyA, IDynamicTreeProxy proxyB)
     {
@@ -354,6 +496,11 @@ public sealed partial class World : IDisposable
         Stack<RigidBody> bodyStack = new(bodies);
         while (bodyStack.Count > 0) Remove(bodyStack.Pop());
 
+        if (NullBody.Shapes.Count > 0)
+        {
+            NullBody.RemoveShapes(NullBody.Shapes, MassInertiaUpdateMode.Preserve);
+        }
+
         // Left-over shapes not associated with a rigid body.
         Stack<IDynamicTreeProxy> proxies = new(DynamicTree.Proxies);
         while (proxies.Count > 0) DynamicTree.RemoveProxy(proxies.Pop());
@@ -361,16 +508,81 @@ public sealed partial class World : IDisposable
     }
 
     /// <summary>
+    /// Reduces excess capacity in internal world storage.
+    /// </summary>
+    /// <remarks>
+    /// Use this after removing many objects to release unused collection capacity.
+    /// Existing bodies, constraints, contacts, and arbiters remain valid.
+    /// Unmanaged simulation buffers are not compacted.
+    /// <para>Do not use or modify this world from other threads while trimming, including queries
+    /// through <see cref="DynamicTree"/>.</para>
+    /// </remarks>
+    /// <exception cref="ObjectDisposedException">Thrown if this world has been disposed.</exception>
+    public void Trim()
+    {
+        ThrowIfDisposed();
+
+        bodies.Trim();
+        islands.Trim();
+        ccdBodies.TrimExcess();
+        ccdBodySet.TrimExcess();
+        ccdQueries.Clear();
+        ccdQueries.TrimExcess();
+
+        deferredArbiters.Trim();
+        brokenArbiters.Trim();
+        dispatchArbiters.TrimExcess();
+        retiredArbiters.TrimExcess();
+
+        arbiters.TrimExcess();
+
+        foreach (Island island in islandPool)
+        {
+            island.TrimLists();
+        }
+
+        islandPool.TrimExcess();
+
+        DynamicTree.Trim();
+
+        handleToIsland.TrimExcess();
+        islandRanges.TrimExcess();
+        sortedContacts.TrimExcess();
+        sortedSmallConstraints.TrimExcess();
+        sortedConstraints.TrimExcess();
+
+        foreach (RigidBody body in bodies)
+        {
+            body.TrimLists();
+        }
+
+        foreach (Island island in islands)
+        {
+            island.TrimLists();
+        }
+    }
+
+    /// <summary>
     /// Removes the specified body from the world. This operation also automatically discards any associated contacts
     /// and constraints.
     /// </summary>
     /// <param name="body">The rigid body to remove.</param>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="body"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">Thrown if <paramref name="body"/> does not belong to this world.</exception>
+    /// <exception cref="InvalidOperationException">Thrown if <paramref name="body"/> has already been removed.</exception>
+    /// <exception cref="ObjectDisposedException">Thrown if this world has been disposed.</exception>
     public void Remove(RigidBody body)
     {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(body);
+
         if (body.World != this)
             throw new ArgumentException("The body does not belong to this world.", nameof(body));
 
         if (body == NullBody) return;
+
+        if (!body.IsValid)
+            throw new InvalidOperationException("The body has already been removed from this world.");
 
         // No need to copy the hashset content first. Removing while iterating does not invalidate
         // the enumerator any longer, see https://github.com/dotnet/runtime/pull/37180
@@ -387,11 +599,18 @@ public sealed partial class World : IDisposable
             shape.RigidBody = null!;
         }
 
+        for (int i = deferredArbiters.Count - 1; i >= 0; i--)
+        {
+            Arbiter arbiter = deferredArbiters[i];
+            if (arbiter.Body1 == body || arbiter.Body2 == body) Remove(arbiter);
+        }
+
         foreach (var contact in body.InternalContacts)
         {
             Remove(contact);
         }
 
+        RemoveCcdBody(body);
         memRigidBodies.Free(body.Handle);
 
         // We must be our own island.
@@ -399,7 +618,7 @@ public sealed partial class World : IDisposable
 
         body.Handle = JHandle<RigidBodyData>.Zero;
 
-        IslandHelper.BodyRemoved(islands, body);
+        IslandHelper.BodyRemoved(islands, islandPool, body);
 
         body.InternalIsland = null!;
 
@@ -411,15 +630,27 @@ public sealed partial class World : IDisposable
     /// <see cref="Constraint.IsEnabled"/> property.
     /// </summary>
     /// <param name="constraint">The constraint to be removed.</param>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="constraint"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// Thrown if <paramref name="constraint"/> does not belong to this world.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">Thrown if the constraint has already been removed.</exception>
+    /// <exception cref="ObjectDisposedException">Thrown if this world has been disposed.</exception>
     public void Remove(Constraint constraint)
     {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(constraint);
+
         if (constraint.Body1.World != this)
             throw new ArgumentException("The constraint does not belong to this world.", nameof(constraint));
+
+        if (!constraint.IsValid)
+            throw new InvalidOperationException("The constraint has already been removed from this world.");
 
         ActivateBodyNextStep(constraint.Body1);
         ActivateBodyNextStep(constraint.Body2);
 
-        IslandHelper.ConstraintRemoved(islands, constraint);
+        IslandHelper.ConstraintRemoved(islands, islandPool, constraint);
 
         if (constraint.IsSmallConstraint)
         {
@@ -431,79 +662,94 @@ public sealed partial class World : IDisposable
         }
 
         constraint.Handle = JHandle<ConstraintData>.Zero;
+        ConstraintRemoved?.Invoke(constraint);
     }
 
     /// <summary>
     /// Removes a particular arbiter from the world.
     /// </summary>
+    /// <param name="arbiter">The arbiter to remove.</param>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="arbiter"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// Thrown if <paramref name="arbiter"/> does not belong to this world.
+    /// </exception>
+    /// <exception cref="ObjectDisposedException">Thrown if this world has been disposed.</exception>
     public void Remove(Arbiter arbiter)
     {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(arbiter);
+
         if (arbiter.Body1.World != this)
             throw new ArgumentException("The arbiter does not belong to this world.", nameof(arbiter));
 
         ActivateBodyNextStep(arbiter.Body1);
         ActivateBodyNextStep(arbiter.Body2);
 
-        IslandHelper.ArbiterRemoved(islands, arbiter);
+        bool pending = false;
+        for (int i = 0; i < deferredArbiters.Count; i++)
+        {
+            if (deferredArbiters[i] != arbiter) continue;
+            deferredArbiters.RemoveAt(i);
+            pending = true;
+            break;
+        }
+
+        if (!pending) IslandHelper.ArbiterRemoved(islands, islandPool, arbiter);
         arbiters.Remove(arbiter.Handle.Data.Key);
 
         brokenArbiters.Remove(arbiter.Handle);
         memContacts.Free(arbiter.Handle);
 
-        arbiter.Handle = JHandle<ContactData>.Zero;
-        arbiter.Body1 = null!;
-        arbiter.Body2 = null!;
+        ReturnArbiter(arbiter);
+    }
 
-        Arbiter.Pool.Push(arbiter);
+    internal void RemoveDeferredArbitersForShape(RigidBody body, ulong shapeId)
+    {
+        for (int i = deferredArbiters.Count - 1; i >= 0; i--)
+        {
+            Arbiter arbiter = deferredArbiters[i];
+            if (arbiter.Body1 != body && arbiter.Body2 != body) continue;
+
+            ArbiterKey key = arbiter.Handle.Data.Key;
+            if (key.Key1 == shapeId || key.Key2 == shapeId) Remove(arbiter);
+        }
     }
 
     /// <summary>
-    /// Marks a body to be activated at the start of the next step.
+    /// Restarts the body's sleep timer and wakes its island at the next deactivation check.
     /// </summary>
     /// <param name="body">The body to activate.</param>
-    /// <param name="wakeUpStatic">Set to true when the intention is to move a static
-    /// body or to switch from another MotionType to static. This then activates all connected bodies.</param>
+    /// <param name="wakeUpStatic">A static body has no island to wake. Set to true when it moved,
+    /// to wake the bodies connected to it instead.</param>
     internal void ActivateBodyNextStep(RigidBody body, bool wakeUpStatic = false)
     {
         body.InternalSleepTime = 0;
 
-        if (body.IsActive) return;
-
-        if (body.MotionType == MotionType.Static && !wakeUpStatic) return;
-
-        AddToActiveList(body.InternalIsland);
-
-        if (body.MotionType == MotionType.Static)
+        if (body.MotionType != MotionType.Static)
         {
-            foreach (var c in body.Constraints)
-            {
-                ActivateBodyNextStep(c.Body1 == body ? c.Body2 : c.Body1);
-            }
-
-            foreach (var c in body.Contacts)
-            {
-               ActivateBodyNextStep(c.Body1 == body ? c.Body2 : c.Body1);
-            }
+            WakeIslandNextStep(body.InternalIsland);
+            return;
         }
 
-        body.Island.NeedsUpdate = true;
+        if (!wakeUpStatic) return;
+
+        foreach (var c in body.InternalConstraints)
+        {
+            ActivateBodyNextStep(c.Body1 == body ? c.Body2 : c.Body1);
+        }
+
+        foreach (var c in body.InternalContacts)
+        {
+            ActivateBodyNextStep(c.Body1 == body ? c.Body2 : c.Body1);
+        }
     }
 
     /// <summary>
-    /// Removes constraints and contacts that connect two non-dynamic bodies.
+    /// Removes contacts that connect two non-dynamic bodies.
     /// </summary>
-    /// <param name="body">The body whose non-dynamic connections should be removed.</param>
-    internal void RemoveStaticStaticConstraints(RigidBody body)
+    /// <param name="body">The body whose non-dynamic contacts should be removed.</param>
+    internal void RemoveStaticStaticContacts(RigidBody body)
     {
-        foreach (var constraint in body.InternalConstraints)
-        {
-            if (constraint.Body1.Data.MotionType != MotionType.Dynamic &&
-                constraint.Body2.Data.MotionType != MotionType.Dynamic)
-            {
-                Remove(constraint);
-            }
-        }
-
         foreach (var arbiter in body.InternalContacts)
         {
             if (arbiter.Body1.Data.MotionType != MotionType.Dynamic &&
@@ -515,6 +761,29 @@ public sealed partial class World : IDisposable
     }
 
     /// <summary>
+    /// Keeps a constraint in the solver's active partition only while a dynamic endpoint is awake.
+    /// This does not change the constraint's enabled state or its island connections.
+    /// </summary>
+    internal void UpdateConstraintActivation(Constraint constraint)
+    {
+        RigidBody body1 = constraint.Body1;
+        RigidBody body2 = constraint.Body2;
+        bool active = (body1.MotionType == MotionType.Dynamic && body1.IsActive) ||
+                      (body2.MotionType == MotionType.Dynamic && body2.IsActive);
+
+        if (constraint.IsSmallConstraint)
+        {
+            if (active) memSmallConstraints.MoveToActive(constraint.SmallHandle);
+            else memSmallConstraints.MoveToInactive(constraint.SmallHandle);
+        }
+        else
+        {
+            if (active) memConstraints.MoveToActive(constraint.Handle);
+            else memConstraints.MoveToInactive(constraint.Handle);
+        }
+    }
+
+    /// <summary>
     /// Rebuilds island connections from the body's existing contacts and constraints.
     /// </summary>
     /// <param name="body">The body whose connections should be rebuilt.</param>
@@ -522,12 +791,12 @@ public sealed partial class World : IDisposable
     {
         foreach (var constraint in body.InternalConstraints)
         {
-            IslandHelper.AddConnection(islands, constraint.Body1, constraint.Body2);
+            IslandHelper.AddConnection(islands, islandPool, constraint.Body1, constraint.Body2);
         }
 
         foreach (var contact in body.InternalContacts)
         {
-            IslandHelper.AddConnection(islands, contact.Body1, contact.Body2);
+            IslandHelper.AddConnection(islands, islandPool, contact.Body1, contact.Body2);
         }
     }
 
@@ -537,24 +806,9 @@ public sealed partial class World : IDisposable
     /// <param name="body">The body whose connections should be removed.</param>
     internal void RemoveConnections(RigidBody body)
     {
-        if (body.InternalConnections.Count > 0)
+        while (body.InternalConnections.Count > 0)
         {
-            int count = body.InternalConnections.Count;
-            var connections = ArrayPool<RigidBody>.Shared.Rent(count);
-
-            try
-            {
-                body.InternalConnections.CopyTo(connections);
-
-                for (int i = 0; i < count; i++)
-                {
-                    IslandHelper.RemoveConnection(islands, body, connections[i]);
-                }
-            }
-            finally
-            {
-                ArrayPool<RigidBody>.Shared.Return(connections, clearArray: true);
-            }
+            IslandHelper.RemoveConnection(islands, islandPool, body, body.InternalConnections[^1]);
         }
 
         Debug.Assert(body.InternalConnections.Count == 0);
@@ -562,12 +816,43 @@ public sealed partial class World : IDisposable
     }
 
     /// <summary>
-    /// Marks a body to be deactivated at the start of the next step.
+    /// Lets the body count as resting long enough to sleep. It stops voting to keep its island
+    /// awake until it moves again.
     /// </summary>
     /// <param name="body">The body to deactivate.</param>
     internal void DeactivateBodyNextStep(RigidBody body)
     {
         body.InternalSleepTime = Real.PositiveInfinity;
+    }
+
+    /// <summary>
+    /// Immediately puts a group of connected bodies to sleep.
+    /// </summary>
+    /// <remarks>
+    /// Works even when <see cref="AllowDeactivation"/> is false. Clears velocities and pending
+    /// forces and torques on the island's dynamic and kinematic bodies.
+    /// </remarks>
+    /// <param name="island">The island to deactivate.</param>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="island"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">Thrown if <paramref name="island"/> does not belong to this world.</exception>
+    public void ForceSleepIsland(Island island)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(island);
+
+        if (!islands.Contains(island))
+        {
+            throw new ArgumentException("The island does not belong to this world.", nameof(island));
+        }
+
+        foreach (RigidBody body in island.InternalBodies)
+        {
+            ClearMotionForSleep(body);
+        }
+
+        island.KeepAwake = false;
+
+        if (islands.IsActive(island)) SleepIsland(island);
     }
 
     /// <summary>
@@ -578,8 +863,13 @@ public sealed partial class World : IDisposable
     /// <param name="body1">The first rigid body involved in the constraint.</param>
     /// <param name="body2">The second rigid body involved in the constraint.</param>
     /// <returns>A new instance of the specified constraint type, already registered with the world.</returns>
-    /// <exception cref="ArgumentException">Thrown if <paramref name="body1"/> and <paramref name="body2"/> are the same.</exception>
-    /// <exception cref="PartitionedBuffer{T}.MaximumSizeException">Raised when the maximum size limit is exceeded.</exception>
+    /// <exception cref="ArgumentException">
+    /// Thrown if either body does not belong to this world.
+    /// </exception>
+    /// <exception cref="SameBodyException">
+    /// Thrown if <paramref name="body1"/> and <paramref name="body2"/> are the same.
+    /// </exception>
+    /// <exception cref="PartitionedBuffer{T}.MaximumSizeException">Raised when the constraint buffer maximum size is exceeded.</exception>
     public T CreateConstraint<T>(RigidBody body1, RigidBody body2) where T : Constraint, new()
     {
         ThrowIfDisposed();
@@ -588,50 +878,59 @@ public sealed partial class World : IDisposable
             throw new ArgumentException("The body does not belong to this world.", nameof(body1));
         if (body2.World != this)
             throw new ArgumentException("The body does not belong to this world.", nameof(body2));
+        if (!body1.IsValid || !body2.IsValid)
+            throw new InvalidOperationException("The body has been removed from this world.");
         if (ReferenceEquals(body1, body2))
-            throw new ArgumentException($"{nameof(body1)} and {nameof(body2)} must be different.");
+            throw new SameBodyException();
 
         T constraint = new();
         ulong constraintId = RequestId();
 
         if (constraint.IsSmallConstraint)
         {
-            constraint.Create(memSmallConstraints.Allocate(true, true), body1, body2);
+            constraint.Create(memSmallConstraints.Allocate(false, true), body1, body2);
             constraint.SmallHandle.Data.ConstraintId = constraintId;
         }
         else
         {
-            constraint.Create(memConstraints.Allocate(true, true), body1, body2);
+            constraint.Create(memConstraints.Allocate(false, true), body1, body2);
             constraint.Handle.Data.ConstraintId = constraintId;
         }
 
-        IslandHelper.ConstraintCreated(islands, constraint);
+        IslandHelper.ConstraintCreated(islands, islandPool, constraint);
 
-        AddToActiveList(body1.InternalIsland);
-        AddToActiveList(body2.InternalIsland);
+        WakeIslandNextStep(body1.InternalIsland);
+        WakeIslandNextStep(body2.InternalIsland);
+
+        UpdateConstraintActivation(constraint);
 
         return constraint;
     }
 
     /// <summary>
-    /// Marks an island as active and moves it to the active partition.
+    /// Keeps an awake island awake through the next deactivation check, or wakes a sleeping one there.
     /// </summary>
-    /// <param name="island">The island to activate.</param>
-    private void AddToActiveList(Island island)
+    /// <remarks>
+    /// The island moves to the active partition at once; its bodies, contacts, constraints and proxies
+    /// follow at the check, so that a call during a step does not change what the step is solving.
+    /// </remarks>
+    /// <param name="island">The island to wake.</param>
+    private void WakeIslandNextStep(Island island)
     {
-        bool wasActive = islands.IsActive(island);
-        island.MarkedAsActive = true;
-        if (!wasActive) island.NeedsUpdate = true;
+        island.KeepAwake = true;
+        if (islands.IsActive(island)) return;
 
+        island.WakePending = true;
         islands.MoveToActive(island);
     }
 
     [Conditional("DEBUG")]
     private void AssertIslandActivationInvariant(Island island)
     {
-        if (island.NeedsUpdate) return;
-
         bool shouldBeActive = islands.IsActive(island);
+
+        Debug.Assert(shouldBeActive || !island.WakePending, "Only awake islands can have a wake pending.");
+        if (island.WakePending) return;
 
         foreach (RigidBody body in island.InternalBodies)
         {
@@ -655,7 +954,7 @@ public sealed partial class World : IDisposable
     /// Creates and adds a new rigid body to the simulation world.
     /// </summary>
     /// <returns>A newly created instance of <see cref="RigidBody"/>.</returns>
-    /// <exception cref="PartitionedBuffer{T}.MaximumSizeException">Raised when the maximum size limit is exceeded.</exception>
+    /// <exception cref="PartitionedBuffer{T}.MaximumSizeException">Raised when the rigid-body buffer maximum size is exceeded.</exception>
     public RigidBody CreateRigidBody()
     {
         ThrowIfDisposed();
@@ -664,14 +963,19 @@ public sealed partial class World : IDisposable
 
         bodies.Add(body, true);
 
-        IslandHelper.BodyAdded(islands, body);
+        IslandHelper.BodyAdded(islands, islandPool, body);
 
-        AddToActiveList(body.InternalIsland);
+        WakeIslandNextStep(body.InternalIsland);
 
         return body;
     }
 
     private bool disposed;
+
+    /// <summary>
+    /// Gets a value indicating whether this world has been disposed.
+    /// </summary>
+    public bool IsDisposed => disposed;
 
     private void ThrowIfDisposed()
     {
@@ -685,10 +989,14 @@ public sealed partial class World : IDisposable
     /// After disposal, the world instance is unusable. All bodies, constraints, and contacts
     /// become invalid. Calling <see cref="Dispose"/> multiple times is safe.
     /// </remarks>
-    public void Dispose()
+    public unsafe void Dispose()
     {
         if (disposed) return;
         disposed = true;
+
+        ccdBodies.Clear();
+        ccdBodySet.Clear();
+        ccdQueries.Clear();
 
         memContacts.Dispose();
         memRigidBodies.Dispose();
@@ -698,5 +1006,8 @@ public sealed partial class World : IDisposable
         deferredContacts.Dispose();
         deferredConstraints.Dispose();
         deferredSmallConstraints.Dispose();
+
+        MemoryHelper.Free(contactSettings);
+        contactSettings = null;
     }
 }

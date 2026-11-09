@@ -38,6 +38,22 @@ public partial class Playground : RenderWindow
 
     private DistanceLimit? grabConstraint;
     private float hitDistance;
+
+    private void ClearGrab()
+    {
+        if (grabConstraint != null &&
+            !grabConstraint.Handle.IsZero &&
+            !grabConstraint.Body1.Handle.IsZero &&
+            !grabConstraint.Body2.Handle.IsZero)
+        {
+            World.Remove(grabConstraint);
+        }
+
+        grabBody = null;
+        grabConstraint = null;
+        grabbing = false;
+    }
+
     private void Pick()
     {
         JVector origin = Conversion.ToJitterVector(Camera.Position);
@@ -45,8 +61,12 @@ public partial class Playground : RenderWindow
 
         if (grabbing)
         {
-            if (grabBody == null) return;
-            if (grabConstraint == null) return;
+            if (grabBody == null || grabBody.Handle.IsZero ||
+                grabConstraint == null || grabConstraint.Handle.IsZero)
+            {
+                ClearGrab();
+                return;
+            }
 
             hitDistance += (float)Mouse.ScrollWheel.Y;
 
@@ -58,6 +78,7 @@ public partial class Playground : RenderWindow
         }
         else
         {
+            if (grabConstraint != null) ClearGrab();
             grabBody = null;
 
             bool result = World.DynamicTree.RayCast(origin, dir, null, null,
@@ -81,8 +102,6 @@ public partial class Playground : RenderWindow
 
             if (grabBody == null || grabBody.MotionType != MotionType.Dynamic) return;
             grabbing = true;
-
-            if (grabConstraint != null) World.Remove(grabConstraint);
 
             grabConstraint = World.CreateConstraint<DistanceLimit>(grabBody, World.NullBody);
             grabConstraint.Initialize(hitPoint, hitPoint);

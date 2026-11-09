@@ -1,5 +1,139 @@
 # Changelog
 
+### Jitter 2.14.0 (2026-11-06)
+
+- Contact manifolds are now built from the support features of both shapes (`ISupportFeature`), fixing contact point errors and rolling drift on curved shapes.
+- Faster and more robust `ConvexHullShape` support queries.
+- Faster arbiter removal through cheaper island connectivity checks.
+- Faster solver: the single-threaded solve no longer takes body locks, and the multithreaded solve releases them more cheaply.
+- Fixed wake requests, such as impulses, being lost when the body's island fell asleep in the same step.
+- `LinearMotor` and `AngularMotor` accept unlimited maximum force or torque, and changing a motor wakes its bodies.
+- Fixed large impulses from nearly redundant constraint rows in double precision.
+- Fixed inaccurate `JQuaternion.ToAxisAngle` results at small angles.
+- Fixed `JTriangle.RayIntersect` reporting short ray directions and small triangles as parallel.
+- `RigidBody.DeactivationThreshold` is obsolete. Use `RigidBody.DeactivationVelocity`, which takes the linear value first.
+- **Breaking Change:** The contact constants on `ContactData.Contact` and `ContactData.CcdRelaxationFactor` moved into the per-world `World.ContactSettings`, which also makes the restitution threshold configurable. `World.CcdRelaxationFactor` is obsolete.
+
+### Jitter 2.13.0 (2026-10-22)
+
+- **Breaking Change:** Removed the previous speculative contact system and replaced it with continuous collision detection (CCD), supporting both translation and rotation with iterative contact discovery. Use `RigidBody.EnableCcd` and the `Ccd*` settings; the old speculative contact API has been removed.
+- Fixed angular `NarrowPhase.Sweep` missing collisions between separated start and end poses. Added a time-limited overload that distinguishes hits, misses, and searches that could not finish.
+- Added a `DynamicTree.SweepCast` overload for shapes that translate and rotate.
+- Improved `ToString` output for bodies, constraints, limits, and math types. Added numeric format and culture options for bodies, limits, and math types.
+- Revised XML API documentation for clearer descriptions and usage guidance.
+
+### Jitter 2.12.2 (2026-10-22)
+
+- Fixed a stack overflow that could occur during dynamic tree balancing, particularly in double precision.
+
+### Jitter 2.12.1 (2026-10-21)
+
+- Improved contact point accuracy against flat surfaces, fixing artificial acceleration of rolling spheres.
+- Fixed outdated contact normals and friction directions when contacting surfaces change orientation.
+- Avoided unnecessary dynamic tree rearrangements during optimization of stationary scenes.
+
+### Jitter 2.12.0 (2026-10-19)
+
+- Added `AngularServo`, `TwistServo`, `LinearServo`, and `LinearAxisServo` for driving target orientations, angles, and positions with torque or force limits.
+- Added `JointDrive` to select a motor or servo when constructing hinge, prismatic, and universal joints. The existing `hasMotor` constructors remain available but are obsolete.
+- Added `DebugDrawSettings.PointRadius` to control point marker size independently of constraint guides.
+- Improved rolling stability by preserving the original contact in auxiliary manifolds with fewer than four points.
+
+### Jitter 2.11.0 (2026-10-18)
+
+- **Breaking Change:** `IDebugDrawer.DrawSegment` and `DrawTriangle` now require a `uint` color packed as `0xRRGGBBAA`. Custom drawers must implement both colored methods.
+- Improved contact and constraint solver performance, especially in multithreaded scenes and for constraints attached to `World.NullBody`.
+- Improved rolling stability with substeps by fixing contact impulses that could artificially accelerate rolling objects.
+- Fixed angular velocity incorrectly influencing speculative contacts. Collision prediction and speculative response now consistently use linear motion.
+- Added `EllipticalConeLimit` for different swing limits in two perpendicular directions, with optional inner limits and unrestricted twist.
+- Expanded debug drawing for shapes, bodies, constraints, and joints, with clearer anchors, limits, axes, and motor directions.
+
+### Jitter 2.10.1 (2026-10-15)
+
+- Added `Constraint.Tag` for attaching custom user data to constraints, matching `RigidBody.Tag`.
+
+### Jitter 2.10.0 (2026-10-11)
+
+- **Breaking Change:** Added `TimeStep` with full-step and substep timing information. World step and substep callbacks and `SoftBody.WorldOnPostStep` now receive `TimeStep`; custom constraint solver callbacks and contact preparation now take `in TimeStep` instead of an inverse timestep.
+- **Breaking Change:** Renamed the three `BoxShape` constructor parameters to `sizeX`, `sizeY`, and `sizeZ`. Update calls using named arguments.
+- **Breaking Change:** `ConvexPolytope` now contains reusable managed storage, and its `InitTetrahedron` methods return a success flag. Added `AddVertexDetailed` for reporting expansion outcomes.
+- Fixed substep scaling of motor force and torque limits and constraint softness, including soft-body springs. This changes simulation behavior when `SubstepCount > 1`.
+- Added `AngularMotor.MaximumTorque` and deprecated its `MaximumForce` alias.
+- Improved EPA robustness with filtered exact predicates and double-precision contact calculations, and improved GJK closest-point precision for small separations.
+- Fixed `TriangleShape` ray casts reporting intersections behind the ray origin.
+- **Breaking Change:** Body motion type changes no longer remove constraints or raise `World.ConstraintRemoved`. Constraints retain their enabled state, are suspended while neither connected body is dynamic, and resume when a dynamic body wakes. Use `World.Remove(constraint)` for permanent removal.
+- Fixed moving kinematic bodies incorrectly falling asleep, including at very low speeds and with a zero deactivation time.
+- Added `DynamicTree.Update(proxy, dt)` and fixed speculative broadphase bounds after velocity, impulse, and speculative contact setting changes, including before the first simulation step.
+- Rebuilt dynamic tree collision pairs immediately when its filter changes, preserving the previous filter and pairs if the new filter throws.
+- Fixed contact and island state when `BeginCollide` handlers remove bodies, shapes, or arbiters, including cancellation of pending contacts.
+- Made `RigidBody.AddShape` roll back on registration or mass calculation failures, and tree proxy registration roll back when filtering throws.
+- Fixed `World.Clear` leaving shapes attached to `World.NullBody`.
+- Made `SoftBody.Destroy` safe after repeated calls, world clearing, or disposal. Added validation and bounding box updates for `SoftBodyTriangle.Thickness`.
+- Fixed neighbor index overflow in large convex hulls and bounding box initialization for detached convex hull and point cloud shapes.
+- Fixed inertia calculation for nested `TransformedShape` instances.
+- Improved validation for removed bodies and constraints, invalid bodies passed to `World.CreateConstraint`, and unregistered dynamic tree proxies.
+- Added debug assertions for invalid rigid body and constraint data access and invalid arbiter creation arguments.
+- `PartitionedSet` enumeration now throws when the set is modified instead of silently skipping elements.
+
+### Jitter 2.9.0 (2026-10-03)
+
+- Added world-space translation and rotation locks via `RigidBody.AllowedMotion` and `MotionAxes`, including planar motion presets.
+- **Breaking Change:** Inertia APIs now use `JSymmetricMatrix`; `RigidBodyData.InverseMass` is replaced by `InverseMassVector`. Update custom shapes and constraints accordingly.
+- Fixed constraint mass solves, angular singularities, and fixed and boundary limits.
+- Fixed speculative contact bias and CCD impulse preservation.
+- Fixed possible overflow in rotation quaternion calculation.
+- Added `TriangleEdgeCollisionFilter.FilterDynamicBodies` to control edge filtering for dynamic triangle bodies (disabled by default).
+
+### Jitter 2.8.13 (2026-09-19)
+
+- Improved recovery from invalid internal state when user-provided code throws exceptions.
+
+### Jitter 2.8.12 (2026-09-15)
+
+- Added `World.Trim` to release excess internal storage after large scene changes.
+- Fixed a multithreaded contact creation race that could create duplicate collision pairs.
+- Fixed managed memory growth from arbiter pooling across worker threads.
+- Improved validation and exception behavior for disposed worlds, removal calls, dynamic tree optimization, worker pools, and unmanaged memory helpers.
+- Improved XML documentation for contact registration threading rules, arbiter lifetime, and public exception behavior.
+
+### Jitter 2.8.11 (2026-09-09)
+
+- Added `World.ConstraintRemoved` for reacting to explicit and automatic constraint removal.
+- Improved `DynamicTree` quality during regular updates with automatic incremental optimization and non-cost-increasing rotations.
+
+### Jitter 2.8.10 (2026-08-31)
+
+- Added `World.IsDisposed` and `IsValid` properties for rigid bodies and constraints, allowing unavailable native state—including automatically removed constraints—to be detected safely.
+- Ensured arbiters remain valid while `EndCollide` callbacks are running.
+- Improved contact allocation and removal performance by eliminating unnecessary data movement between buffer partitions.
+
+### Jitter 2.8.9 (2026-07-24)
+
+- Improved multithreading performance by reducing contention and cache-line ping-pong in reader-writer locks.
+
+### Jitter 2.8.8 (2026-05-24)
+
+- Fixed triangle edge contact filtering by re-evaluating contacts after EPA.
+- Rejected degenerate `PointCloudShape` volumes and zero-mass `ConvexHullShape` inputs during construction.
+- Improved exception reporting for validation failures. Also added XML documentation for public exception behavior.
+
+### Jitter 2.8.7 (2026-05-17)
+
+- Added `World.ForceSleepIsland` for immediately deactivating an island.
+- Added argument validation for invalid shape dimensions, masses, constraint axes, and limits.
+- Added debug-only checks for runtime state changes.
+- Improved cleanup when simulation fails or gets interrupted.
+- Fixed empty `DynamicTree` cost calculation.
+
+### Jitter 2.8.6 (2026-05-15)
+
+- Added support for using multiple `World` instances from different host threads.
+- Added `World.IslandActivated` and `World.IslandDeactivated` events for observing simulation island wake/sleep transitions.
+- Fixed deterministic solver iteration handling in `SolveMode.Deterministic`.
+- Fixed nested dynamic tree queries so callbacks may safely perform additional `RayCast`, `SweepCast`, and `FindNearest` queries.
+- Fixed stale queued forces and torques when changing a body's `MotionType`.
+- **Breaking Change:** Previously obsolete compatibility APIs now produce compile-time errors. Use the replacement APIs named in the obsolete messages.
+
 ### Jitter 2.8.5 (2026-04-25)
 
 - Improved `CollisionManifold`.

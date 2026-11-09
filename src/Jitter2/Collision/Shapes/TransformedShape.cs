@@ -4,12 +4,14 @@
  * SPDX-License-Identifier: MIT
  */
 
+using System;
+using Jitter2.DataStructures;
 using Jitter2.LinearMath;
 
 namespace Jitter2.Collision.Shapes;
 
 /// <summary>
-/// Represents a shape wrapper defined by an original shape and an affine transformation (translation and linear map).
+/// Applies translation, rotation, scaling, or shear to another shape in local coordinates.
 /// </summary>
 public class TransformedShape : RigidBodyShape
 {
@@ -24,22 +26,56 @@ public class TransformedShape : RigidBodyShape
     private JMatrix transformation;
     private TransformationType type;
 
+    private struct TransformedSink<TSink>(TSink target, JMatrix transform, JVector offset) : ISink<JTriangle>
+        where TSink : ISink<JTriangle>
+    {
+        public TSink Target = target;
+        private readonly bool reverseWinding = transform.Determinant() < 0;
+
+        public void Add(in JTriangle triangle)
+        {
+            JVector a = JVector.Transform(triangle.V0, transform) + offset;
+            JVector b = JVector.Transform(triangle.V1, transform) + offset;
+            JVector c = JVector.Transform(triangle.V2, transform) + offset;
+            if (reverseWinding) (b, c) = (c, b);
+            Target.Add(new JTriangle(a, b, c));
+        }
+    }
+
+    /// <inheritdoc/>
+    protected internal override void DebugDrawLocal<TSink>(ref TSink triangleSink, in DebugDrawSettings settings)
+    {
+        var sink = new TransformedSink<TSink>(triangleSink, transformation, translation);
+        OriginalShape.DebugDrawLocal(ref sink, settings);
+        triangleSink = sink.Target;
+    }
+
     /// <summary>
-    /// Constructs a transformed shape through an affine transformation defined by
-    /// a linear map and a translation.
+    /// Creates a shape with a linear transformation followed by a translation.
     /// </summary>
+    /// <param name="shape">The shape to transform.</param>
+    /// <param name="translation">The translation component of the affine transform.</param>
+    /// <param name="transform">The linear component of the affine transform.</param>
+    /// <exception cref="ArgumentNullException">
+    /// Thrown when <paramref name="shape"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="translation"/> or <paramref name="transform"/> contains a non-finite value.
+    /// </exception>
     public TransformedShape(RigidBodyShape shape, in JVector translation, in JMatrix transform)
     {
+        ArgumentNullException.ThrowIfNull(shape);
+
         OriginalShape = shape;
-        this.translation = translation;
-        this.transformation = transform;
+        this.translation = ArgumentCheck.Finite(translation, nameof(translation));
+        this.transformation = ArgumentCheck.Finite(transform, nameof(transform));
 
         AnalyzeTransformation();
         UpdateWorldBoundingBox();
     }
 
     /// <summary>
-    /// Constructs a transformed shape with a translation (offset), assuming identity rotation/scale.
+    /// Applies a translation to the shape, with no rotation or scaling.
     /// </summary>
     public TransformedShape(RigidBodyShape shape, JVector translation) :
         this(shape, translation, JMatrix.Identity)
@@ -47,8 +83,7 @@ public class TransformedShape : RigidBodyShape
     }
 
     /// <summary>
-    /// Constructs a transformed shape with a linear transformation (rotation, scale, or shear),
-    /// assuming zero translation.
+    /// Creates a shape with rotation, scaling, or shear and no translation.
     /// </summary>
     public TransformedShape(RigidBodyShape shape, JMatrix transform) :
         this(shape, JVector.Zero, transform)
@@ -68,6 +103,7 @@ public class TransformedShape : RigidBodyShape
         get => translation;
         set
         {
+            DebugCheck.IsFinite(value, nameof(value));
             translation = value;
             UpdateWorldBoundingBox();
         }
@@ -94,6 +130,7 @@ public class TransformedShape : RigidBodyShape
         get => transformation;
         set
         {
+            DebugCheck.IsFinite(value, nameof(value));
             transformation = value;
             AnalyzeTransformation();
             UpdateWorldBoundingBox();
@@ -115,6 +152,32 @@ public class TransformedShape : RigidBodyShape
             JVector.Transform(sm, transformation, out result);
             result += translation;
         }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Forwards to the original shape. Under a scaling transformation the tolerance applies to the
+    /// angle in the original shape's frame.
+    /// </remarks>
+    public override int SupportFeature(in JVector direction, Real tolerance, Span<JVector> vertices)
+    {
+        if (type == TransformationType.Identity)
+        {
+            int identityCount = OriginalShape.SupportFeature(direction, tolerance, vertices);
+            for (int i = 0; i < identityCount; i++) vertices[i] += translation;
+            return identityCount;
+        }
+
+        JVector.TransposedTransform(direction, transformation, out JVector dir);
+        int count = OriginalShape.SupportFeature(dir, tolerance, vertices);
+
+        for (int i = 0; i < count; i++)
+        {
+            JVector.Transform(vertices[i], transformation, out JVector transformed);
+            vertices[i] = transformed + translation;
+        }
+
+        return count;
     }
 
     /// <inheritdoc/>
@@ -141,9 +204,15 @@ public class TransformedShape : RigidBodyShape
     }
 
     /// <inheritdoc/>
-    public override void CalculateMassInertia(out JMatrix inertia, out JVector com, out Real mass)
+    public override void CalculateMassInertia(out JSymmetricMatrix inertia, out JVector com, out Real mass)
     {
-        OriginalShape.CalculateMassInertia(out JMatrix originalInertia, out JVector originalCom, out mass);
+        OriginalShape.CalculateMassInertia(out JSymmetricMatrix originalInertia, out JVector originalCom, out mass);
+
+        // The source inertia is about its local origin. Move it to the center of mass
+        // before transforming, so an existing offset is not counted a second time.
+        JSymmetricMatrix originalParallelAxis = mass *
+            (JSymmetricMatrix.Identity * originalCom.LengthSquared() - JSymmetricMatrix.Outer(originalCom));
+        JSymmetricMatrix centralInertia = originalInertia - originalParallelAxis;
 
         com = JVector.Transform(originalCom, transformation) + translation;
 
@@ -151,19 +220,19 @@ public class TransformedShape : RigidBodyShape
         mass *= det;
 
         // The inertia tensor I is related to the second moment matrix C by: I = trace(C)·E - C
-        // Under transformation T, the second moment transforms as: C' = |det(T)| · T · C · Tᵀ
+        // Under transformation T, the central second moment transforms as: C' = |det(T)| · T · C · Tᵀ
         // We recover C from I: C = (trace(I)/2)·E - I
-        Real halfTrace = originalInertia.Trace() * (Real)0.5;
-        JMatrix secondMoment = halfTrace * JMatrix.Identity - originalInertia;
+        Real halfTrace = centralInertia.Trace() * (Real)0.5;
+        JSymmetricMatrix secondMoment = halfTrace * JSymmetricMatrix.Identity - centralInertia;
 
         // Transform second moment matrix
-        JMatrix transformedSecondMoment = det * transformation * secondMoment * JMatrix.Transpose(transformation);
+        JSymmetricMatrix transformedSecondMoment = det * JSymmetricMatrix.Transform(secondMoment, transformation);
 
         // Convert back to inertia tensor
-        inertia = transformedSecondMoment.Trace() * JMatrix.Identity - transformedSecondMoment;
+        inertia = transformedSecondMoment.Trace() * JSymmetricMatrix.Identity - transformedSecondMoment;
 
-        // Apply parallel axis theorem for translation
-        JMatrix pat = mass * (JMatrix.Identity * com.LengthSquared() - JVector.Outer(com, com));
+        // Move the transformed inertia from its center of mass to the local origin.
+        JSymmetricMatrix pat = mass * (JSymmetricMatrix.Identity * com.LengthSquared() - JSymmetricMatrix.Outer(com));
         inertia += pat;
     }
 }

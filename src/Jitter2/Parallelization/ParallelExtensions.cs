@@ -11,11 +11,12 @@ using Jitter2.Unmanaged;
 namespace Jitter2.Parallelization;
 
 /// <summary>
-/// Provides parallel batch processing extension methods for collections used by the physics engine.
+/// Divides collections into index ranges for parallel processing.
 /// </summary>
 /// <remarks>
-/// These methods divide collections into batches and distribute them across worker threads.
-/// The batch count is determined by the task threshold and available threads.
+/// Callbacks may run concurrently. With <c>execute: true</c>, each method waits for completion;
+/// otherwise, call <see cref="ThreadPool.Execute"/> on the shared pool to run the queued batches.
+/// Do not queue batches concurrently or change a collection while its batches are being processed.
 /// </remarks>
 public static class ParallelExtensions
 {
@@ -23,7 +24,8 @@ public static class ParallelExtensions
     /// Processes array elements in parallel batches.
     /// </summary>
     /// <param name="array">The array to process.</param>
-    /// <param name="taskThreshold">Minimum elements per batch. Fewer elements result in a single batch.</param>
+    /// <param name="taskThreshold">Positive target batch size used to choose the number of batches;
+    /// actual batches can be smaller or larger.</param>
     /// <param name="action">The callback to invoke for each batch.</param>
     /// <param name="execute">If <see langword="true"/>, calls <see cref="ThreadPool.Execute"/> to start execution.</param>
     /// <returns>The number of batches generated.</returns>
@@ -43,7 +45,8 @@ public static class ParallelExtensions
     /// </summary>
     /// <typeparam name="T">The unmanaged element type.</typeparam>
     /// <param name="list">The buffer to process.</param>
-    /// <param name="taskThreshold">Minimum elements per batch. Fewer elements result in a single batch.</param>
+    /// <param name="taskThreshold">Positive target batch size used to choose the number of batches;
+    /// actual batches can be smaller or larger.</param>
     /// <param name="action">The callback to invoke for each batch.</param>
     /// <param name="execute">If <see langword="true"/>, calls <see cref="ThreadPool.Execute"/> to start execution.</param>
     /// <returns>The number of batches generated.</returns>
@@ -63,7 +66,8 @@ public static class ParallelExtensions
     /// </summary>
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="list">The set to process.</param>
-    /// <param name="taskThreshold">Minimum elements per batch. Fewer elements result in a single batch.</param>
+    /// <param name="taskThreshold">Positive target batch size used to choose the number of batches;
+    /// actual batches can be smaller or larger.</param>
     /// <param name="action">The callback to invoke for each batch.</param>
     /// <param name="execute">If <see langword="true"/>, calls <see cref="ThreadPool.Execute"/> to start execution.</param>
     /// <returns>The number of batches generated.</returns>
@@ -83,7 +87,8 @@ public static class ParallelExtensions
     /// </summary>
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="partitionedSet">The set to process.</param>
-    /// <param name="taskThreshold">Minimum elements per batch. Fewer elements result in a single batch.</param>
+    /// <param name="taskThreshold">Positive target batch size used to choose the number of batches;
+    /// actual batches can be smaller or larger.</param>
     /// <param name="action">The callback to invoke for each batch.</param>
     /// <param name="execute">If <see langword="true"/>, calls <see cref="ThreadPool.Execute"/> to start execution.</param>
     /// <returns>The number of batches generated.</returns>
@@ -103,7 +108,8 @@ public static class ParallelExtensions
     /// </summary>
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="list">The bag to process.</param>
-    /// <param name="taskThreshold">Minimum elements per batch. Fewer elements result in a single batch.</param>
+    /// <param name="taskThreshold">Positive target batch size used to choose the number of batches;
+    /// actual batches can be smaller or larger.</param>
     /// <param name="action">The callback to invoke for each batch.</param>
     /// <param name="execute">If <see langword="true"/>, calls <see cref="ThreadPool.Execute"/> to start execution.</param>
     /// <returns>The number of batches generated.</returns>

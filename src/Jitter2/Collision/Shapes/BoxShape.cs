@@ -16,25 +16,27 @@ public class BoxShape : RigidBodyShape
 {
     private JVector halfSize;
 
+    /// <inheritdoc/>
+    protected internal override void DebugDrawLocal<TSink>(ref TSink triangleSink, in DebugDrawSettings settings)
+    {
+        ShapeDebugDraw.Box(ref triangleSink, halfSize);
+    }
+
     /// <summary>
     /// Creates a box shape with specified dimensions.
     /// </summary>
-    /// <param name="size">The dimensions of the box.</param>
+    /// <param name="size">The full extents of the box in the local x-, y-, and z-directions.</param>
     /// <exception cref="ArgumentOutOfRangeException">
     /// Thrown when any component of <paramref name="size"/> is less than or equal to zero.
     /// </exception>
     public BoxShape(JVector size)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(size.X, nameof(size));
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(size.Y, nameof(size));
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(size.Z, nameof(size));
-
-        halfSize = (Real)0.5 * size;
+        halfSize = (Real)0.5 * ArgumentCheck.PositiveComponents(size, nameof(size));
         UpdateWorldBoundingBox();
     }
 
     /// <summary>
-    /// Gets or sets the dimensions of the box.
+    /// Gets or sets the full extents of the box in the local x-, y-, and z-directions.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">
     /// Thrown when any component of <paramref name="value"/> is less than or equal to zero.
@@ -44,11 +46,7 @@ public class BoxShape : RigidBodyShape
         get => (Real)2.0 * halfSize;
         set
         {
-            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value.X, nameof(Size));
-            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value.Y, nameof(Size));
-            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value.Z, nameof(Size));
-
-            halfSize = value * (Real)0.5;
+            halfSize = ArgumentCheck.PositiveComponents(value, nameof(Size)) * (Real)0.5;
             UpdateWorldBoundingBox();
         }
     }
@@ -62,29 +60,26 @@ public class BoxShape : RigidBodyShape
     /// </exception>
     public BoxShape(Real size)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(size);
-
-        halfSize = new JVector(size * (Real)0.5);
+        halfSize = new JVector(ArgumentCheck.Positive(size, nameof(size)) * (Real)0.5);
         UpdateWorldBoundingBox();
     }
 
     /// <summary>
-    /// Creates a box shape with the specified length, height, and width.
+    /// Creates a box shape with the specified extents in the local x-, y-, and z-directions.
     /// </summary>
-    /// <param name="length">The length of the box.</param>
-    /// <param name="height">The height of the box.</param>
-    /// <param name="width">The width of the box.</param>
+    /// <param name="sizeX">The full extent of the box in the local x-direction.</param>
+    /// <param name="sizeY">The full extent of the box in the local y-direction.</param>
+    /// <param name="sizeZ">The full extent of the box in the local z-direction.</param>
     /// <exception cref="ArgumentOutOfRangeException">
-    /// Thrown when <paramref name="length"/>, <paramref name="height"/>, or <paramref name="width"/> is less than
+    /// Thrown when <paramref name="sizeX"/>, <paramref name="sizeY"/>, or <paramref name="sizeZ"/> is less than
     /// or equal to zero.
     /// </exception>
-    public BoxShape(Real width, Real height, Real length)
+    public BoxShape(Real sizeX, Real sizeY, Real sizeZ)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(length);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
-
-        halfSize = (Real)0.5 * new JVector(width, height, length);
+        halfSize = (Real)0.5 * new JVector(
+            ArgumentCheck.Positive(sizeX, nameof(sizeX)),
+            ArgumentCheck.Positive(sizeY, nameof(sizeY)),
+            ArgumentCheck.Positive(sizeZ, nameof(sizeZ)));
         UpdateWorldBoundingBox();
     }
 
@@ -93,6 +88,58 @@ public class BoxShape : RigidBodyShape
         result.X = MathHelper.SignBit(direction.X) * halfSize.X;
         result.Y = MathHelper.SignBit(direction.Y) * halfSize.Y;
         result.Z = MathHelper.SignBit(direction.Z) * halfSize.Z;
+    }
+
+    /// <inheritdoc/>
+    public override int SupportFeature(in JVector direction, Real tolerance, Span<JVector> vertices)
+    {
+        // A component close to zero leaves the box free along that axis: one such axis makes the
+        // feature an edge, two make it a face. Bits 0, 1 and 2 mark free X, Y and Z.
+        Real toleranceSq = tolerance * tolerance * direction.LengthSquared();
+        int free = (direction.X * direction.X < toleranceSq ? 1 : 0)
+                   | (direction.Y * direction.Y < toleranceSq ? 2 : 0)
+                   | (direction.Z * direction.Z < toleranceSq ? 4 : 0);
+
+        SupportMap(direction, out JVector v);
+        JVector h = halfSize;
+
+        switch (free)
+        {
+            case 0b011:
+                vertices[0] = new JVector(h.X, h.Y, v.Z);
+                vertices[1] = new JVector(-h.X, h.Y, v.Z);
+                vertices[2] = new JVector(-h.X, -h.Y, v.Z);
+                vertices[3] = new JVector(h.X, -h.Y, v.Z);
+                return 4;
+            case 0b101:
+                vertices[0] = new JVector(h.X, v.Y, h.Z);
+                vertices[1] = new JVector(-h.X, v.Y, h.Z);
+                vertices[2] = new JVector(-h.X, v.Y, -h.Z);
+                vertices[3] = new JVector(h.X, v.Y, -h.Z);
+                return 4;
+            case 0b110:
+                vertices[0] = new JVector(v.X, h.Y, h.Z);
+                vertices[1] = new JVector(v.X, -h.Y, h.Z);
+                vertices[2] = new JVector(v.X, -h.Y, -h.Z);
+                vertices[3] = new JVector(v.X, h.Y, -h.Z);
+                return 4;
+            case 0b001:
+                vertices[0] = new JVector(h.X, v.Y, v.Z);
+                vertices[1] = new JVector(-h.X, v.Y, v.Z);
+                return 2;
+            case 0b010:
+                vertices[0] = new JVector(v.X, h.Y, v.Z);
+                vertices[1] = new JVector(v.X, -h.Y, v.Z);
+                return 2;
+            case 0b100:
+                vertices[0] = new JVector(v.X, v.Y, h.Z);
+                vertices[1] = new JVector(v.X, v.Y, -h.Z);
+                return 2;
+            default:
+                // No free axis, or a direction too short to decide one.
+                vertices[0] = v;
+                return 1;
+        }
     }
 
     public override bool LocalRayCast(in JVector origin, in JVector direction, out JVector normal, out Real lambda)
@@ -168,7 +215,6 @@ public class BoxShape : RigidBodyShape
                 lambda = t0;
                 normal = direction.Z < (Real)0.0 ? JVector.UnitZ : -JVector.UnitZ;
             }
-            //if (t1 < exit) exit = t1;
         }
         else if (origin.Z < min.Z || origin.Z > max.Z)
         {
@@ -191,12 +237,12 @@ public class BoxShape : RigidBodyShape
         box.Max = position + ths;
     }
 
-    public override void CalculateMassInertia(out JMatrix inertia, out JVector com, out Real mass)
+    public override void CalculateMassInertia(out JSymmetricMatrix inertia, out JVector com, out Real mass)
     {
         JVector size = halfSize * (Real)2.0;
         mass = size.X * size.Y * size.Z;
 
-        inertia = JMatrix.Identity;
+        inertia = JSymmetricMatrix.Identity;
         inertia.M11 = (Real)(1.0 / 12.0) * mass * (size.Y * size.Y + size.Z * size.Z);
         inertia.M22 = (Real)(1.0 / 12.0) * mass * (size.X * size.X + size.Z * size.Z);
         inertia.M33 = (Real)(1.0 / 12.0) * mass * (size.X * size.X + size.Y * size.Y);

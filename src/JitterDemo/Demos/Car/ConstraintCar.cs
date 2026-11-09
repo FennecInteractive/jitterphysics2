@@ -42,7 +42,7 @@ public class ConstraintCar
         car.AddShape(tfs1);
         car.AddShape(tfs2);
         car.Position = new JVector(0, 2, 0);
-        car.SetMassInertia(new JMatrix(0.4f, 0, 0, 0, 0.4f, 0, 0, 0, 1.0f), 1.0f);
+        car.SetMassInertia(JSymmetricMatrix.CreateScale(0.4f, 0.4f, 1.0f), 1.0f);
 
         for (int i = 0; i < 4; i++)
         {
@@ -93,7 +93,7 @@ public class ConstraintCar
 
         for (int i = 0; i < 4; i++)
         {
-            sockets[i] = new HingeJoint(world, damper[i], wheels[i], wheels[i].Position, JVector.UnitX, true);
+            sockets[i] = new HingeJoint(world, damper[i], wheels[i], wheels[i].Position, JVector.UnitX, JointDrive.Motor);
         }
 
         if (world.BroadPhaseFilter is not Common.IgnoreCollisionBetweenFilter filter)
@@ -136,16 +136,16 @@ public class ConstraintCar
         float currentAngleL = (float)damperJoints[FrontLeft].HingeAngle.Angle;
         float currentAngleR = (float)damperJoints[FrontRight].HingeAngle.Angle;
 
-        steerMotor[FrontLeft].MaximumForce = 10.0f * Math.Abs(targetAngle - currentAngleL);
+        steerMotor[FrontLeft].MaximumTorque = 10.0f * Math.Abs(targetAngle - currentAngleL);
         steerMotor[FrontLeft].TargetVelocity = 10.0f * (targetAngle - currentAngleL);
 
-        steerMotor[FrontRight].MaximumForce = 10.0f * Math.Abs(targetAngle - currentAngleR);
+        steerMotor[FrontRight].MaximumTorque = 10.0f * Math.Abs(targetAngle - currentAngleR);
         steerMotor[FrontRight].TargetVelocity = 10.0f * (targetAngle - currentAngleR);
 
         for (int i = 0; i < 4; i++)
         {
             wheels[i].Friction = 0.8f;
-            sockets[i].Motor.MaximumForce = 1.0f * MathF.Abs(accelerate);
+            sockets[i].Motor.MaximumTorque = 1.0f * MathF.Abs(accelerate);
             sockets[i].Motor.TargetVelocity = -80.0f * accelerate;
         }
     }

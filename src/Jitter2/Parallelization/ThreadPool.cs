@@ -8,6 +8,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using Jitter2.DataStructures;
 using Jitter2.Unmanaged;
@@ -71,17 +72,16 @@ namespace Jitter2.Parallelization;
  */
 
 /// <summary>
-/// Provides a persistent worker thread pool for parallel task execution within the physics engine.
+/// Runs queued tasks on reusable worker threads and the calling thread.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Worker threads are kept alive for the lifetime of the pool to avoid wake-up overhead.
-/// Tasks are distributed via per-thread queues with work stealing for load balancing.
+/// Add tasks with <see cref="AddTask{T}"/>, then call <see cref="Execute"/> to run them and wait
+/// for completion. Do not queue tasks, execute them, or change the thread count concurrently.
 /// </para>
 /// <para>
-/// The main thread participates as "worker 0" during <see cref="Execute"/> calls.
-/// Use <see cref="ResumeWorkers"/> and <see cref="PauseWorkers"/> to control thread activity
-/// between simulation steps.
+/// Call <see cref="PauseWorkers"/> to reduce CPU usage between executions.
+/// <see cref="Execute"/> resumes workers automatically.
 /// </para>
 /// </remarks>
 public sealed class ThreadPool
@@ -101,8 +101,14 @@ public sealed class ThreadPool
             _counter = _total;
 
             Tracer.ProfileBegin(Action);
-            Action(Parameter);
-            Tracer.ProfileEnd(Action);
+            try
+            {
+                Action(Parameter);
+            }
+            finally
+            {
+                Tracer.ProfileEnd(Action);
+            }
         }
 
         private static readonly List<Task<T>> pool = new(32);
@@ -139,14 +145,23 @@ public sealed class ThreadPool
 
     private MemoryHelper.IsolatedInt tasksLeft;
     private int threadCount;
+    private ExceptionDispatchInfo? capturedException;
 
     private static ThreadPool? _instance;
 
     /// <summary>
-    /// Gets the number of worker threads managed by this pool.
+    /// Gets the total number of threads that can process tasks, including the calling thread.
     /// </summary>
-    /// <value>Includes the main thread as worker 0.</value>
     public int ThreadCount => threadCount;
+
+    /// <summary>
+    /// Gets whether worker threads have been requested to pause when idle.
+    /// </summary>
+    /// <remarks>
+    /// A value of <see langword="true"/> does not guarantee that every worker is already blocked;
+    /// workers may still be finishing previously queued work.
+    /// </remarks>
+    public bool IsPaused => !mainResetEvent.IsSet;
 
     private ThreadPool()
     {
@@ -178,15 +193,19 @@ public sealed class ThreadPool
     public static int ThreadCountSuggestion => Math.Max((int)(Environment.ProcessorCount * ThreadsPerProcessor), 1);
 
     /// <summary>
-    /// Changes the number of worker threads.
+    /// Changes the total thread count, including the calling thread.
     /// </summary>
-    /// <param name="numThreads">The new thread count.</param>
+    /// <param name="numThreads">The new thread count. Use 1 to process tasks only on the calling thread.</param>
     /// <remarks>
-    /// Existing worker threads are stopped and new ones are created.
-    /// This operation blocks until all previous threads have terminated.
+    /// This method waits for the previous worker threads to stop before creating replacements.
     /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="numThreads"/> is less than one.
+    /// </exception>
     public void ChangeThreadCount(int numThreads)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(numThreads, 1);
+
         if (numThreads == threadCount) return;
 
         running = false;
@@ -206,7 +225,7 @@ public sealed class ThreadPool
 
         threads = new Thread[threadCount - 1];
 
-        var initWaitHandle = new AutoResetEvent(false);
+        using AutoResetEvent initWaitHandle = new(false);
 
         for (int i = 0; i < threadCount - 1; i++)
         {
@@ -236,8 +255,11 @@ public sealed class ThreadPool
     /// Tasks are not executed until <see cref="Execute"/> is called.
     /// This method is not thread-safe and must be called from a single thread.
     /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="action"/> is <see langword="null"/>.</exception>
     public void AddTask<T>(Action<T> action, T parameter)
     {
+        ArgumentNullException.ThrowIfNull(action);
+
         var instance = Task<T>.GetFree();
         instance.Action = action;
         instance.Parameter = parameter;
@@ -251,8 +273,9 @@ public sealed class ThreadPool
     public static bool InstanceInitialized => _instance != null;
 
     /// <summary>
-    /// Gets the singleton instance of the <see cref="ThreadPool"/>.
+    /// Gets the shared <see cref="ThreadPool"/> instance.
     /// </summary>
+    /// <remarks>Do not access this property concurrently before the pool has been initialized.</remarks>
     public static ThreadPool Instance
     {
         get
@@ -266,8 +289,8 @@ public sealed class ThreadPool
     /// Resumes all worker threads so they can process queued tasks.
     /// </summary>
     /// <remarks>
-    /// Called automatically by <see cref="Execute"/>. Manual calls are typically only needed
-    /// when using <see cref="World.ThreadModelType.Persistent"/>.
+    /// Called automatically by <see cref="Execute"/> and by the world during multithreaded steps.
+    /// Manual calls are useful when managing the pool directly.
     /// </remarks>
     public void ResumeWorkers()
     {
@@ -278,7 +301,7 @@ public sealed class ThreadPool
     /// Pauses all worker threads after they finish their current tasks.
     /// </summary>
     /// <remarks>
-    /// Workers will block on a wait handle until <see cref="ResumeWorkers"/> is called.
+    /// Workers wait until <see cref="ResumeWorkers"/> is called.
     /// This reduces CPU usage between simulation steps.
     /// </remarks>
     public void PauseWorkers()
@@ -296,8 +319,7 @@ public sealed class ThreadPool
 
             while (myQueue.TryDequeue(out var task))
             {
-                task.Perform();
-                Interlocked.Decrement(ref tasksLeft.Value);
+                PerformTask(task);
                 performedTasks++;
             }
 
@@ -305,14 +327,14 @@ public sealed class ThreadPool
             if (performedTasks > 0)
             {
                 // steal from other queues
-                for (int i = 1; i < queues.Length; i++)
+                int queueCount = queues.Length;
+                for (int i = 1; i < queueCount; i++)
                 {
-                    int queueIndex = (i + index) % queues.Length;
+                    int queueIndex = (i + index) % queueCount;
 
                     while (queues[queueIndex].TryDequeue(out var task))
                     {
-                        task.Perform();
-                        Interlocked.Decrement(ref tasksLeft.Value);
+                        PerformTask(task);
                     }
                 }
             }
@@ -322,54 +344,76 @@ public sealed class ThreadPool
         }
     }
 
+    private void PerformTask(ITask task)
+    {
+        try
+        {
+            task.Perform();
+        }
+        catch (Exception exception)
+        {
+            Interlocked.CompareExchange(
+                ref capturedException,
+                ExceptionDispatchInfo.Capture(exception),
+                null);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref tasksLeft.Value);
+        }
+    }
+
     /// <summary>
     /// Executes all queued tasks and blocks until completion.
     /// </summary>
     /// <remarks>
-    /// <para>
-    /// Tasks are distributed to per-thread queues in round-robin order. The main thread
-    /// participates as worker 0 and performs work stealing from other queues.
-    /// </para>
-    /// <para>
-    /// This method automatically calls <see cref="ResumeWorkers"/> at the start.
-    /// </para>
+    /// The calling thread also processes tasks. Workers are resumed automatically.
+    /// If a task throws an exception, all tasks finish before the exception is rethrown here.
     /// </remarks>
     public void Execute()
     {
         ResumeWorkers();
 
+        Interlocked.Exchange(ref capturedException, null);
+
         int totalTasks = taskList.Count;
+        int queueCount = ThreadCount;
         Volatile.Write(ref tasksLeft.Value, totalTasks);
 
         for (int i = 0; i < totalTasks; i++)
         {
-            queues[i % this.ThreadCount].Enqueue(taskList[i]);
+            queues[i % queueCount].Enqueue(taskList[i]);
         }
 
         taskList.Clear();
 
-        // the main thread's queue.
+        // Process the main thread's queue first.
         var myQueue = queues[0];
 
         while (myQueue.TryDequeue(out var task))
         {
-            task.Perform();
-            Interlocked.Decrement(ref tasksLeft.Value);
+            PerformTask(task);
         }
 
-        // steal from other queues
+        // Steal from other queues.
         for (int i = 1; i < queues.Length; i++)
         {
             while (queues[i].TryDequeue(out var task))
             {
-                task.Perform();
-                Interlocked.Decrement(ref tasksLeft.Value);
+                PerformTask(task);
             }
         }
 
         while (Volatile.Read(ref tasksLeft.Value) > 0)
         {
             Thread.SpinWait(1);
+        }
+
+        var exception = Volatile.Read(ref capturedException);
+        if (exception != null)
+        {
+            PauseWorkers();
+            exception.Throw();
         }
     }
 }

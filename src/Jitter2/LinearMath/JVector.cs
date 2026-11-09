@@ -14,7 +14,7 @@ namespace Jitter2.LinearMath;
 /// Represents a three-dimensional vector with components of type <see cref="Real"/>.
 /// </summary>
 [StructLayout(LayoutKind.Explicit, Size = 3 * sizeof(Real))]
-public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
+public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>, IFormattable
 {
     internal static JVector InternalZero;
     internal static JVector Arbitrary;
@@ -57,7 +57,7 @@ public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
         InternalZero = Zero;
     }
 
-    [Obsolete($"Do not use any longer.")]
+    [Obsolete($"Do not use any longer.", true)]
     public void Set(Real x, Real y, Real z)
     {
         X = x;
@@ -101,9 +101,17 @@ public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
     /// <summary>
     /// Returns a string representation of the <see cref="JVector"/>.
     /// </summary>
-    public readonly override string ToString()
+    public readonly override string ToString() => ToString(null, null);
+
+    /// <summary>Formats the components using the specified numeric format and the current culture.</summary>
+    public readonly string ToString(string? format) => ToString(format, null);
+
+    /// <summary>Formats the components using the specified numeric format and culture.</summary>
+    /// <param name="format">A numeric format string, or null or empty to use the general format.</param>
+    /// <param name="formatProvider">The format provider, or null to use the current culture.</param>
+    public readonly string ToString(string? format, IFormatProvider? formatProvider)
     {
-        return $"X={X:F6}, Y={Y:F6}, Z={Z:F6}";
+        return $"X={X.ToString(format, formatProvider)}, Y={Y.ToString(format, formatProvider)}, Z={Z.ToString(format, formatProvider)}";
     }
 
     public readonly override bool Equals(object? obj)
@@ -217,10 +225,35 @@ public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
     }
 
     /// <summary>
+    /// Calculates <c>matrix * vector</c> using a symmetric matrix without expanding its storage.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static JVector Transform(in JVector vector, in JSymmetricMatrix matrix)
+    {
+        Transform(vector, matrix, out JVector result);
+        return result;
+    }
+
+    /// <summary>
+    /// Calculates <c>matrix * vector</c> using a symmetric matrix without expanding its storage.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Transform(in JVector vector, in JSymmetricMatrix matrix, out JVector result)
+    {
+        Real x = vector.X * matrix.M11 + vector.Y * matrix.M12 + vector.Z * matrix.M13;
+        Real y = vector.X * matrix.M12 + vector.Y * matrix.M22 + vector.Z * matrix.M23;
+        Real z = vector.X * matrix.M13 + vector.Y * matrix.M23 + vector.Z * matrix.M33;
+
+        result.X = x;
+        result.Y = y;
+        result.Z = z;
+    }
+
+    /// <summary>
     /// Transforms the vector by a quaternion rotation.
     /// </summary>
     /// <param name="vector">The vector to transform.</param>
-    /// <param name="quat">The quaternion representing the rotation.</param>
+    /// <param name="quat">The unit quaternion representing the rotation.</param>
     /// <returns>The rotated vector.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static JVector Transform(in JVector vector, in JQuaternion quat)
@@ -295,7 +328,7 @@ public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
     /// Transforms the vector by a quaternion rotation.
     /// </summary>
     /// <param name="vector">The vector to transform.</param>
-    /// <param name="quaternion">The quaternion representing the rotation.</param>
+    /// <param name="quaternion">The unit quaternion representing the rotation.</param>
     /// <param name="result">Output: The rotated vector.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Transform(in JVector vector, in JQuaternion quaternion, out JVector result)
@@ -314,7 +347,7 @@ public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
     }
 
     /// <summary>
-    /// Transforms the vector by the conjugate of a quaternion (inverse rotation).
+    /// Transforms the vector by the conjugate of a unit quaternion (inverse rotation).
     /// </summary>
     /// <param name="vector">The vector to transform.</param>
     /// <param name="quaternion">The quaternion (conjugated during operation).</param>
@@ -464,7 +497,7 @@ public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public readonly override int GetHashCode() => HashCode.Combine(X, Y, Z);
 
-    [Obsolete($"Use static {nameof(NegateInPlace)} instead.")]
+    [Obsolete($"Use static {nameof(NegateInPlace)} instead.", true)]
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Negate()
     {
@@ -542,15 +575,15 @@ public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
     }
 
     [Obsolete($"In-place Normalize() is deprecated; " +
-              $"use the static {nameof(JVector.Normalize)} method or {nameof(JVector.NormalizeInPlace)}.")]
+              $"use the static {nameof(JVector.Normalize)} method or {nameof(JVector.NormalizeInPlace)}.", true)]
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Normalize()
     {
-        Real num2 = X * X + Y * Y + Z * Z;
-        Real num = (Real)1.0 / MathR.Sqrt(num2);
-        X *= num;
-        Y *= num;
-        Z *= num;
+        Real lengthSquared = X * X + Y * Y + Z * Z;
+        Real invLength = (Real)1.0 / MathR.Sqrt(lengthSquared);
+        X *= invLength;
+        Y *= invLength;
+        Z *= invLength;
     }
 
     /// <summary>
@@ -559,11 +592,11 @@ public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
     /// <param name="toNormalize">The vector to normalize.</param>
     public static void NormalizeInPlace(ref JVector toNormalize)
     {
-        Real num2 = toNormalize.LengthSquared();
-        Real num = (Real)1.0 / MathR.Sqrt(num2);
-        toNormalize.X *= num;
-        toNormalize.Y *= num;
-        toNormalize.Z *= num;
+        Real lengthSquared = toNormalize.LengthSquared();
+        Real invLength = (Real)1.0 / MathR.Sqrt(lengthSquared);
+        toNormalize.X *= invLength;
+        toNormalize.Y *= invLength;
+        toNormalize.Z *= invLength;
     }
 
     /// <summary>
@@ -619,6 +652,13 @@ public partial struct JVector(Real x, Real y, Real z) : IEquatable<JVector>
     {
         Multiply(value1, scaleFactor, out JVector result);
         return result;
+    }
+
+    /// <summary>Multiplies two vectors component-wise.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static JVector Multiply(in JVector value1, in JVector value2)
+    {
+        return new JVector(value1.X * value2.X, value1.Y * value2.Y, value1.Z * value2.Z);
     }
 
     /// <summary>
